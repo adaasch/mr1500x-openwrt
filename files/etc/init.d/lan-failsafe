@@ -1,0 +1,54 @@
+#!/bin/sh /etc/rc.common
+# MR1500X LAN failsafe — last-resort reachability.
+#
+# Rationale: this board has NO UART. If netifd fails to configure the LAN (wrong
+# ifname, missing driver, bad uci), the device boots fine but is completely
+# unreachable and the only recovery is physically forcing U-Boot rescue. That
+# already cost us one recovery cycle.
+#
+# So: 60s after boot, if nothing owns 192.168.1.1, bring the LAN up by hand at
+# the raw-netdev level. This never fights netifd — it only acts when netifd has
+# demonstrably not done the job.
+#
+# Runs last, and in the background so it can never stall boot.
+START=99
+
+boot() { start "$@"; }
+
+lan_has_ip() {
+	ip -4 addr show 2>/dev/null | grep -q '192\.168\.1\.1/'
+}
+
+failsafe() {
+	sleep 60
+	lan_has_ip && exit 0
+
+	logger -t lan-failsafe "netifd did not configure LAN; applying failsafe"
+
+	# power up the switch PHYs — without this there is no carrier at all
+	# (vendor kernel keeps ports down until userspace writes this knob)
+	[ -e /proc/rtl865x/link ] && echo 1 > /proc/rtl865x/link 2>/dev/null
+
+	# make sure the vlan netdev exists even if vendor-vlan didn't run
+	# (vconfig is not shipped in this rootfs — use iproute2)
+	[ -w /proc/net/vlan/vlanEnable ] && echo "1 1" > /proc/net/vlan/vlanEnable 2>/dev/null
+	[ -d /sys/class/net/eth0.2 ] || \
+		ip link add link eth0 name eth0.2 type vlan id 2 2>/dev/null
+
+	brctl addbr br-lan 2>/dev/null
+	brctl addif br-lan eth0.2 2>/dev/null
+	ip link set eth0 up 2>/dev/null
+	ip link set eth0.2 up 2>/dev/null
+	ip link set br-lan up 2>/dev/null
+	ip addr add 192.168.1.1/24 dev br-lan 2>/dev/null
+
+	# if the bridge path failed, fall back to the bare vlan netdev
+	lan_has_ip || ip addr add 192.168.1.1/24 dev eth0.2 2>/dev/null
+
+	logger -t lan-failsafe "failsafe applied: $(ip -4 -o addr show | tr '\n' ' ')"
+}
+
+start() {
+	failsafe &
+	return 0
+}

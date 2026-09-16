@@ -1,0 +1,87 @@
+#!/bin/sh
+# MR1500X / MR60Xv2 — the single physical button (WPS + Reset are one button).
+#
+# HOW IT GETS HERE
+#   The vendor kernel registers gpio-keys-polled.0 on gpio33 (E1, KEY_RESTART,
+#   active-low, 50 ms poll) — but it is built with `# CONFIG_INPUT is not set`,
+#   so there is no /dev/input and no input subsystem AT ALL. The vendor's
+#   gpio-button-hotplug.ko (vermagic 4.4.176, shipped in /lib/modules/4.4.176/
+#   and loaded by /etc/init.d/mr1500x-hw) binds that platform device and emits
+#   HOTPLUG UEVENTS instead. procd routes them via /etc/hotplug.json:
+#       [ "button", "/etc/rc.button/%BUTTON%" ]
+#   KEY_RESTART maps to the name "reset", so this file is the handler.
+#   Env: ACTION=pressed|released, BUTTON=reset, SEEN=<seconds held>.
+#
+# WHY THIS REPLACES THE STOCK /etc/rc.button/reset
+#   The stock script hard-wires "held >= 5 s => jffs2reset -y && reboot" with
+#   no way to configure it. Here the behaviour comes from uci system.@button[]
+#   so it can be set from LuCI (System -> LEDs & Buttons).
+#
+#   The uci sections name an EFFECT, not a shell command. That is deliberate:
+#   this config is web-editable, and a free-form `handler` string would turn
+#   the LuCI form into a root shell. Add new effects to run_action() below.
+#
+# NOTE the older /etc/hotplug.d/button/00-button scheme (copied from the vendor
+# rootfs) does NOT work on this image and must not come back: it sources
+# /etc/functions.sh, which is the pre-2012 OpenWrt path — 21.02 has
+# /lib/functions.sh — so every invocation dies before it reads a single option.
+# procd calls /etc/rc.button/ anyway; that is the only live path.
+
+. /lib/functions.sh
+
+[ "$BUTTON" = "reset" ] || exit 0
+
+# Only the release carries a hold duration, and acting on press would make
+# every action fire at 0 s. procd can also deliver ACTION=timeout; ignore it.
+[ "$ACTION" = "released" ] || exit 0
+[ -n "$SEEN" ] || exit 0
+
+run_action() {
+	case "$1" in
+	reboot)
+		logger -t button "reset held ${SEEN}s -> reboot"
+		sync
+		reboot
+		;;
+	factory_reset)
+		# Erases the rootfs_data overlay only. That partition is hard-bounded
+		# at flash 0xa00000..0xfa0000 and stops exactly at the factory guard,
+		# so the MAC and the radio calibration in the factory tail SURVIVE
+		# (the bound is compiled into the rootfs_data_part module). What is
+		# lost: every setting made
+		# since flashing — network, wifi, LuCI password, dropbear host keys.
+		logger -t button "reset held ${SEEN}s -> FACTORY RESET (overlay erase)"
+		sync
+		jffs2reset -y && reboot &
+		;;
+	none|"")
+		;;
+	*)
+		logger -t button "unknown action '$1' (want: none|reboot|factory_reset)"
+		;;
+	esac
+}
+
+# First section whose [min,max] window contains SEEN wins.
+matched=0
+check_button() {
+	local button min max action
+	[ "$matched" = 1 ] && return 0
+
+	config_get button "$1" button
+	config_get min    "$1" min
+	config_get max    "$1" max
+	config_get action "$1" action
+
+	[ "$button" = "$BUTTON" ] || return 0
+	[ -n "$min" ] && [ -n "$max" ] || return 0
+	[ "$SEEN" -ge "$min" ] && [ "$SEEN" -le "$max" ] || return 0
+
+	matched=1
+	run_action "$action"
+}
+
+config_load system
+config_foreach check_button button
+
+exit 0

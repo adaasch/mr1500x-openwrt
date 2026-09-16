@@ -1,0 +1,94 @@
+# MR1500X / MR60Xv2 — THE Wi-Fi configuration. Applied by /etc/init.d/mr1500x-wifi.
+#
+# This file is the authority for the radios: it is what start() reads.
+# /etc/config/wireless is the UI front-end — LuCI's "Save & Apply" runs
+# `/etc/init.d/mr1500x-wifi reload`, which mirrors the edited fields back into
+# THIS file and restarts the changed BSSes. So both routes work and end up
+# here; edits made directly here need `/etc/init.d/mr1500x-wifi reload` to be
+# applied (or a reboot).
+#
+# The two bands are different chips with different drivers:
+#   2.4 GHz  phy0 / wlan1*  rtl8192cd   (in-SoC, RTL8197F)
+#   5 GHz    phy1 / wlan0*  rtk_wifi6   (RTL8832BR on PCIe, 5 GHz only)
+# Note the inversion: wlan1 is 2.4 GHz and wlan0 is 5 GHz.
+#
+# /usr/sbin/wpad carries 900-rtl8192cd-sta-assoc-reply.patch, without which no
+# client can associate on 2.4 GHz at all: the driver offloads the association
+# response to hostapd (REPLY_ASSOC_BY_HAPD) while also claiming
+# WIPHY_FLAG_HAVE_AP_SME, and upstream driver_nl80211.c has no .sta_assoc op to
+# bridge the two.
+#
+# macaddr: the vendor kernel leaves the wifi netdevs at 00:00:00:00:00:00 / 02:..
+# / 0a:.. / 0e:.., so they MUST be set explicitly or every unit ships the same
+# bogus address.
+#
+# *** THERE IS DELIBERATELY NO `option macaddr` HERE. ***
+# It used to hold this unit's literal addresses, which is correct on exactly one
+# device: in a published image it would put the build unit's radio MACs on every
+# router that flashes it (duplicate MACs on the air, a nas_identifier that is no
+# longer unique per AP, and the build unit's address leaked to every downloader).
+# Absent = /etc/init.d/mr1500x-wifi derives it from THIS unit's factory MAC at
+# mtd2 0xba0008 (base = eth0, wlan0 = base-1, wlan1 = base with the
+# locally-administered bit). See /lib/functions/mr1500x-mac.sh. Setting one by
+# hand still overrides, for anyone who needs that.
+#
+# country: governs legal channels and TX power. *** CHANGE IT ***  The 5 GHz
+# RF tables carry per-region limits (FCC/ETSI/MKK/IC/KCC/ACMA/...) and the
+# driver picks by this value, so a wrong country transmits outside your local
+# rules. 'DE' here is a placeholder, not a recommendation.
+#
+# key: there is none, and both radios ship disabled. Set an SSID and a
+# passphrase in LuCI (Network -> Wireless -> Enable), or here followed by
+#     /etc/init.d/mr1500x-wifi reload
+# An image cannot ship a secret: it would be the same on every unit and
+# printed in the release notes.
+
+config wifi 'radio2g'
+	option enabled '0'
+	option ifname 'wlan1'
+	option phy 'phy0'
+	option ssid 'MR1500X'
+	option encryption 'psk2'
+	option channel '1'
+	option country 'DE'
+	option bridge 'br-lan'
+
+config wifi 'radio5g'
+	option enabled '0'
+	option ifname 'wlan0'
+	option phy 'phy1'
+	option ssid 'MR1500X-5G'
+	option encryption 'psk2'
+	option channel '44'
+	option htmode 'HT40+'
+	option country 'DE'
+	option bridge 'br-lan'
+
+# ---------------------------------------------------------------------------
+# Upstream Wi-Fi CLIENT (wwan uplink) — applied by /etc/init.d/mr1500x-wwan.
+#
+# SHIPPED OFF AND UNCONFIGURED ON PURPOSE. A flashed unit must not go looking
+# for someone's network, and credentials do not belong in an image. Set them on
+# the device:
+#     uci set mr1500x-wifi.wwan.ssid='YourNetwork'
+#     uci set mr1500x-wifi.wwan.key='YourPassphrase'
+#     uci set mr1500x-wifi.wwan.enabled='1'
+#     uci commit mr1500x-wifi && /etc/init.d/mr1500x-wwan restart
+#
+# The LAN side is unaffected: br-lan keeps serving DHCP on the ethernet ports.
+# This only makes the box a DHCP *client* on the upstream radio link.
+#
+# key: a plaintext passphrase, or a 64-hex pre-derived PSK. The two are
+# EQUIVALENT — one is not a workaround for the other, and a 4-way handshake that
+# never completes means the passphrase is wrong (that is what it turned out to
+# be here). See WIFI.md §7.
+# device: the 2.4 GHz STA vdev. It shares the radio with the 2.4 GHz AP, so
+# joining a network on another channel moves our own AP to that channel.
+# ---------------------------------------------------------------------------
+
+config wwan 'wwan'
+	option enabled '0'
+	option ssid ''
+	option key ''
+	option encryption 'psk2'
+	option device 'wlan1-vxd'

@@ -1,0 +1,20 @@
+# MR1500X — keep the hardware flow table in step with the uplink.
+#
+# Mirrors stock's etc/hotplug.d/iface/01-hwnat: when the WAN goes down its
+# offloaded flows are stale (they point at an address/route that no longer
+# exists), so flush them; when it comes back, re-apply the configured mode.
+# Without the flush, traffic can keep being steered into a dead path in
+# hardware, where neither conntrack nor the firewall can see it.
+#
+# `echo 8 > /proc/hw_nat` is the flush; see /etc/init.d/mr1500x-hwnat.
+
+[ "$INTERFACE" = "wan" ] || return 0
+
+case "$ACTION" in
+ifup)
+	/etc/init.d/mr1500x-hwnat start
+	;;
+ifdown)
+	[ -e /proc/hw_nat ] && echo 8 >/proc/hw_nat 2>/dev/null
+	;;
+esac

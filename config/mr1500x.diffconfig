@@ -1,0 +1,146 @@
+#
+# OpenWrt 21.02.7 config seed for the MR1500X userspace.
+#
+# PROVENANCE: `scripts/diffconfig.sh` of the OpenWrt tree that built the image
+# this release is derived from. It is a DIFF against
+# the target's defaults, so it must be applied as:
+#
+#     cp mr1500x.diffconfig <openwrt>/.config && make defconfig
+#
+# *** THE FEEDS MUST BE INSTALLED FIRST ***
+# `make defconfig` SILENTLY DROPS every CONFIG_PACKAGE_* symbol it does not
+# know, and the luci symbols do not exist until `scripts/feeds install` has
+# created package/feeds/luci/*. Doing it in the wrong order produces a rootfs
+# with no web UI and no error message — verify after defconfig:
+#     grep -q '^CONFIG_PACKAGE_luci-base=y'          .config
+#     grep -q '^CONFIG_PACKAGE_wpad-basic-wolfssl=y' .config
+# (See feeds.conf in this directory; the same trap has cost a build before.)
+#
+# NOTES ON INDIVIDUAL LINES
+#   TARGET_ramips_mt7621 / DEVICE_adslr_g7
+#       We do not use this target's KERNEL at all — the device boots the vendor
+#       4.4.176 and we only repackage the mipsel_24kc musl USERSPACE. The
+#       profile is kept because it is what the proven rootfs was built from;
+#       changing it changes the default package set.
+#   kmod-* lines
+#       Selected for their USERSPACE halves (iptables/fw3 need the netfilter
+#       kmod metadata to resolve). The .ko files themselves are built for
+#       5.4.238 and are STRIPPED from the image by build_image.sh — they can
+#       never load on the vendor kernel.
+#   wpad-basic-wolfssl, dropbear, squashfs/256K
+#       Not listed: they are already the target defaults. wpad is rebuilt with
+#       900-rtl8192cd-sta-assoc-reply.patch and asserted at package time.
+#
+#   BUILDBOT + the four symbols pinned off under it
+#       BUILDBOT is upstream's "this is an automated build, not a developer's
+#       working copy" switch, and it is the only guard on the one thing in this
+#       image that was genuinely random: base-files generates a local usign
+#       keypair when SIGNED_PACKAGES is on and installs the public half as
+#       /etc/opkg/keys/<its own fingerprint>. That is a different filename and
+#       different bytes on every clean build — and it is dead weight besides,
+#       because it verifies packages signed by THIS buildroot and nobody
+#       publishes a feed signed with it. BUILDBOT skips the install; the
+#       official 21.02 release key from openwrt-keyring stays, so `opkg update`
+#       against the feeds in distfeeds.conf is still signature-checked. Turning
+#       SIGNED_PACKAGES off would also have removed the key, and would have
+#       taken the keyring and the check with it — the opposite of what we want.
+#       BUILDBOT flips four other defaults, all pinned back off here: it is a
+#       default source, not a lock, so an explicit line wins.
+#   REPRODUCIBLE_DEBUG_INFO
+#       Strips the build path out of debug info. Without it the path reaches
+#       the linker, the linker hashes it into the GNU build-id, and libelf
+#       comes out different from a build in a different directory even though
+#       the code is identical.
+#
+CONFIG_TARGET_ramips=y
+CONFIG_TARGET_ramips_mt7621=y
+CONFIG_TARGET_ramips_mt7621_DEVICE_adslr_g7=y
+CONFIG_BUILDBOT=y
+CONFIG_REPRODUCIBLE_DEBUG_INFO=y
+# *** DO NOT DESELECT THE MEDIATEK WI-FI PACKAGES. ***
+#
+# They look like obvious dead weight and they are not. kmod-mt76* / kmod-mt7615*
+# arrive as a default of the adslr_g7 device profile — an mt7621 board with a
+# MediaTek radio — while this board has two Realtek radios on a 4.4 kernel. The
+# .ko files and the mt7615 firmware blob are already deleted from the image as
+# unloadable, so what is left is five packages' worth of opkg metadata, a few
+# KB. Removing them was tried. It cost the 5 GHz band twice, for two unrelated
+# reasons, because in OpenWrt a "driver package" is also how hostapd's feature
+# set is chosen:
+#
+#   1. kmod-mt7615e was the only thing selecting kmod-mac80211, and the hostapd
+#      Makefile gates CONFIG_DRIVER_NL80211 on it. Result: a wpad with no
+#      nl80211 driver at all — 220 KB smaller and unable to bring up any radio.
+#   2. With mac80211 pinned back on by hand, the driver packages were still the
+#      only things depending on @DRIVER_11AC_SUPPORT, which gates
+#      CONFIG_IEEE80211AC. Result: a wpad that rejects the 5 GHz config with
+#      "unknown configuration item 'ieee80211ac'" and "'vht_oper_chwidth'",
+#      both of which /etc/init.d/mr1500x-wifi writes for band a. 2.4 GHz came
+#      up fine and 5 GHz did not, on an image that built clean.
+#
+# DRIVER_11AC_SUPPORT has no prompt, so it cannot simply be set here — defconfig
+# recomputes it from what depends on it. The only other package that pulls it in
+# is kmod-mac80211-hwsim, a simulated radio, and selecting a fake driver to flip
+# a hidden flag is how this kind of breakage happens in the first place. So the
+# MediaTek packages stay, the few KB of metadata stay with them, and the two
+# kmod-mt76-*.control files stay on the short list of things that differ between
+# clean builds. That is the cheaper problem.
+#
+# mac80211 and cfg80211 are named explicitly anyway — they come back via the
+# MediaTek driver, but the dependency is invisible and was worth writing down.
+CONFIG_PACKAGE_kmod-cfg80211=y
+CONFIG_PACKAGE_kmod-mac80211=y
+# CONFIG_ALL is not set
+# CONFIG_ALL_KMODS is not set
+# CONFIG_ALL_NONSHARED is not set
+# CONFIG_COLLECT_KERNEL_DEBUG is not set
+# CONFIG_JSON_OVERVIEW_IMAGE_INFO is not set
+# CONFIG_FEED_luci is not set
+CONFIG_PACKAGE_cgi-io=y
+CONFIG_PACKAGE_ethtool=y
+CONFIG_PACKAGE_firewall=y
+CONFIG_PACKAGE_ip-tiny=y
+CONFIG_PACKAGE_kmod-ipt-conntrack=y
+CONFIG_PACKAGE_kmod-ipt-core=y
+CONFIG_PACKAGE_kmod-ipt-nat=y
+CONFIG_PACKAGE_kmod-nf-conntrack=y
+CONFIG_PACKAGE_kmod-nf-conntrack6=y
+CONFIG_PACKAGE_kmod-nf-ipt=y
+CONFIG_PACKAGE_kmod-nf-nat=y
+CONFIG_PACKAGE_kmod-nf-reject=y
+CONFIG_PACKAGE_libelf=y
+CONFIG_PACKAGE_libip4tc=y
+CONFIG_PACKAGE_libip6tc=y
+CONFIG_PACKAGE_libiwinfo-lua=y
+CONFIG_PACKAGE_liblua=y
+CONFIG_PACKAGE_liblucihttp=y
+CONFIG_PACKAGE_liblucihttp-lua=y
+CONFIG_PACKAGE_libubus-lua=y
+CONFIG_PACKAGE_libxtables=y
+CONFIG_PACKAGE_lua=y
+CONFIG_PACKAGE_luci=y
+CONFIG_PACKAGE_luci-app-firewall=y
+CONFIG_PACKAGE_luci-app-opkg=y
+CONFIG_PACKAGE_luci-base=y
+CONFIG_PACKAGE_luci-lib-base=y
+CONFIG_PACKAGE_luci-lib-ip=y
+CONFIG_PACKAGE_luci-lib-jsonc=y
+CONFIG_PACKAGE_luci-lib-nixio=y
+CONFIG_PACKAGE_luci-mod-admin-full=y
+CONFIG_PACKAGE_luci-mod-network=y
+CONFIG_PACKAGE_luci-mod-status=y
+CONFIG_PACKAGE_luci-mod-system=y
+CONFIG_PACKAGE_luci-proto-ipv6=y
+CONFIG_PACKAGE_luci-proto-ppp=y
+CONFIG_PACKAGE_luci-theme-bootstrap=y
+CONFIG_PACKAGE_rpcd=y
+CONFIG_PACKAGE_rpcd-mod-file=y
+CONFIG_PACKAGE_rpcd-mod-iwinfo=y
+CONFIG_PACKAGE_rpcd-mod-luci=y
+CONFIG_PACKAGE_rpcd-mod-rrdns=y
+CONFIG_PACKAGE_uhttpd=y
+CONFIG_PACKAGE_uhttpd-mod-lua=y
+CONFIG_PACKAGE_uhttpd-mod-ubus=y
+CONFIG_PACKAGE_wireless-tools=y
+CONFIG_PACKAGE_zlib=y
+CONFIG_uhttpd_lua=y

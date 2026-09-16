@@ -1,0 +1,110 @@
+# MR1500X / MR60Xv2 — wireless.
+#
+# *** THIS FILE IS THE UI FRONT-END. mr1500x-wifi IS THE AUTHORITY. ***
+# The radios are brought up by /etc/init.d/mr1500x-wifi (S35), which reads
+# /etc/config/mr1500x-wifi. This file exists so netifd/LuCI can SEE them — and,
+# since 2026-09-04, so LuCI can CHANGE them: "Save & Apply" on the wireless page
+# runs `/etc/init.d/mr1500x-wifi reload` (hooked up in /etc/config/ucitrack),
+# which mirrors ssid/key/encryption/channel/htmode/country/disabled into
+# /etc/config/mr1500x-wifi and restarts only the BSSes that actually changed.
+# Editing /etc/config/mr1500x-wifi directly is equivalent and also supported.
+#
+# The client uplink (the 'wwan' sta section below) is editable the same way,
+# with one difference: it is run by /etc/init.d/mr1500x-wwan (wpa_supplicant),
+# so applying it RESTARTS THAT SERVICE instead of restarting a BSS.
+# ⚠ If you are reaching this box through the uplink, changing it drops your own
+# connection — and a wrong passphrase does not come back on its own.
+#
+# WHY IT IS LIKE THIS
+#   netifd drives radios through /lib/netifd/wireless/mac80211.sh, which calls
+#     iw phy <phy> interface add ...
+#   That call HANGS this driver hard: the box stays pingable but every service
+#   dies, and a REBOOT DOES NOT CLEAR IT — only a power cycle does. On a device
+#   with no UART that is a recovery trip.
+#
+#   `option type 'mac80211'` here does NOT mean upstream's mac80211 driver.
+#   /lib/netifd/wireless/mac80211.sh has been REPLACED by a reporting-only
+#   driver: it tells netifd which of the already-running netdevs are up and
+#   touches nothing else — no iw, no hostapd, no interface ever created or
+#   destroyed. The dangerous upstream script is not shipped at all, so nothing
+#   on this box can make the call that wedges the hardware.
+#
+#   The name is deliberate and load-bearing. LuCI keys its whole wireless UI off
+#   this value (wireless.js: `hwtype = uci.get('wireless',<radio>,'type')`, then
+#   `if (hwtype == 'mac80211')` around the entire encryption list, the
+#   passphrase field and the channel/htmode selectors). Any other value matches
+#   no branch, and you get a wireless page with no way to set a password. That
+#   is exactly what happened while this said 'mr1500x'.
+#
+#   `disabled '0'` is therefore both SAFE and REQUIRED: it means "let the
+#   reporting driver run", not "let netifd configure the radio".
+#
+#   *** The invariant is the CONTENT of /lib/netifd/wireless/mac80211.sh. ***
+#   It must remain ours (it never calls `iw`); the build asserts this. If some
+#   package ever restores upstream's version, this config becomes the
+#   box-wedging combination it used to warn about. See WIFI.md §8.
+#
+# HARDWARE (confirmed on the device, not guessed):
+#   phy0 = 2.4 GHz, 802.11n  (HT only)         -> netdevs wlan1*
+#   phy1 = 5 GHz,   802.11ax (VHT + HE, AP)    -> netdevs wlan0*  (RTL8832BR)
+# Note the inversion: phy0 carries the wlan1 netdevs and phy1 the wlan0 ones.
+#
+# No `option network` on any vif, on purpose: netifd must never attach or detach
+# these from br-lan. hostapd does the bridging (`bridge=` in the config that
+# mr1500x-wifi generates) and /etc/init.d/mr1500x-wwan owns the uplink binding.
+# It also means a LuCI "Save & Apply" here cannot pull a live AP off the bridge.
+#
+# No `option key` in the SHIPPED file: the passphrase belongs in
+# /etc/config/mr1500x-wifi alone, not duplicated into the image twice. Once
+# someone sets a key from LuCI it is of course stored here too — that is
+# unavoidable, since this is the file LuCI edits.
+
+config wifi-device 'radio0'
+	option type	'mac80211'
+	option phy	'phy0'
+	option band	'2g'
+	option channel	'1'
+	option htmode	'HT20'
+	option country	'DE'
+	# Ships OFF. Enable it in LuCI once you have set an SSID and a passphrase.
+	option disabled	'1'
+
+config wifi-iface 'default_radio0'
+	option device	'radio0'
+	option ifname	'wlan1'
+	option mode	'ap'
+	option ssid	'MR1500X'
+	option encryption	'psk2'
+
+# The upstream client uplink shares phy0 with the 2.4 GHz AP. It is reported to
+# netifd only while wlan1-vxd is actually up, so on a unit where no uplink is
+# configured (the shipped default) it simply does not appear in LuCI.
+#
+# *** SHIPPED WITH NO ssid AND NO key, AND IT MUST STAY THAT WAY. ***
+# Credentials belong on a device, never in an image (the build enforces this).
+# `option ssid` being ABSENT is meaningful: /etc/init.d/mr1500x-wifi reads that
+# as "never seeded" and publishes the unit's real uplink config into this file
+# on boot, so LuCI shows the truth. An ssid that is PRESENT BUT EMPTY means the
+# opposite — someone cleared it in LuCI to switch the uplink off.
+config wifi-iface 'wwan'
+	option device	'radio0'
+	option ifname	'wlan1-vxd'
+	option mode	'sta'
+	option encryption	'psk2'
+
+config wifi-device 'radio1'
+	option type	'mac80211'
+	option phy	'phy1'
+	option band	'5g'
+	option channel	'44'
+	option htmode	'HT40+'
+	option country	'DE'
+	# Ships OFF. Enable it in LuCI once you have set an SSID and a passphrase.
+	option disabled	'1'
+
+config wifi-iface 'default_radio1'
+	option device	'radio1'
+	option ifname	'wlan0'
+	option mode	'ap'
+	option ssid	'MR1500X-5G'
+	option encryption	'psk2'

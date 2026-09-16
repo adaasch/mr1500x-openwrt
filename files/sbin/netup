@@ -1,0 +1,84 @@
+#!/bin/sh
+# netup — procd-independent network bring-up + reachability guard.
+#
+# WHY THIS EXISTS
+# This board has no UART. If OpenWrt's init (procd / rcS / netifd) fails or
+# hangs, every rc.d-based recovery never runs and the device is unreachable —
+# the only fix is physically forcing U-Boot rescue. So this runs straight from
+# /etc/inittab as a `::respawn:` entry, which procd starts independently of the
+# sysinit task, keeping the box reachable even if the rest of userspace dies.
+#
+# WHAT IT DOES
+#  1. Powers up the RTL8367 switch PHYs (echo 1 > /proc/rtl865x/link). The
+#     vendor kernel holds the ports administratively DOWN until userspace asks;
+#     stock does this once from /etc/rc.d/S99zphyport -> link_up_all_ports().
+#     Without it there is NO ethernet carrier at all.
+#  2. Ensures the LAN CPU-trunk VLAN netdev eth0.2 exists and is up.
+#  3. Gives netifd a grace period, then configures 192.168.1.1 by hand if
+#     netifd never did.
+#
+# *** DO NOT WRITE /proc/rtl865x/link UNCONDITIONALLY IN THE LOOP ***
+# Every write triggers a full PHY re-enable in the vendor driver
+# ("phyEnableAll_set OK" in dmesg) which BOUNCES THE LINK. An earlier version
+# wrote it every 10 s and produced exactly that: carrier flapping every ~11.5 s,
+# i.e. intermittent ethernet. Measured on-device: 8 re-init events in 100 s.
+# So: assert it once at start, and afterwards ONLY when the link is actually
+# down. Same rule for the interface/IP setup — act only when something is
+# missing, never re-apply on a healthy system.
+
+GRACE=6			# loops before self-assigning the IP (6 * 10s = 60s)
+n=0
+
+phy_up() {
+	[ -e /proc/rtl865x/link ] && echo 1 > /proc/rtl865x/link 2>/dev/null
+}
+
+lan_carrier() {		# 1 = link up on the CPU trunk
+	cat /sys/class/net/eth0/carrier 2>/dev/null || echo 0
+}
+
+has_lan_ip() {
+	ifconfig 2>/dev/null | grep -q '192\.168\.1\.1'
+}
+
+ensure_vlan() {
+	[ -w /proc/net/vlan/vlanEnable ] && echo "1 1" > /proc/net/vlan/vlanEnable 2>/dev/null
+	[ -d /sys/class/net/eth0 ] && [ "$(cat /sys/class/net/eth0/operstate 2>/dev/null)" = "down" ] \
+		&& ifconfig eth0 up 2>/dev/null
+	# the vendor kernel creates eth0.2 itself; this is only a fallback
+	[ -d /sys/class/net/eth0.2 ] || \
+		ip link add link eth0 name eth0.2 type vlan id 2 2>/dev/null
+	[ -d /sys/class/net/eth0.2 ] && \
+		[ "$(cat /sys/class/net/eth0.2/operstate 2>/dev/null)" = "down" ] && \
+		ifconfig eth0.2 up 2>/dev/null
+	return 0
+}
+
+# --- one-time bring-up -------------------------------------------------------
+phy_up
+ensure_vlan
+
+# --- steady state: touch nothing unless something is actually wrong ----------
+while :; do
+	sleep 10
+
+	# re-assert the PHYs ONLY if the link is genuinely down
+	if [ "$(lan_carrier)" != "1" ]; then
+		phy_up
+		ensure_vlan
+	fi
+
+	if has_lan_ip; then
+		n=0
+	else
+		n=$((n + 1))
+		if [ "$n" -ge "$GRACE" ]; then
+			ensure_vlan
+			brctl addbr br-lan 2>/dev/null
+			brctl addif br-lan eth0.2 2>/dev/null
+			ifconfig br-lan 192.168.1.1 netmask 255.255.255.0 up 2>/dev/null
+			has_lan_ip || \
+				ifconfig eth0.2 192.168.1.1 netmask 255.255.255.0 up 2>/dev/null
+		fi
+	fi
+done

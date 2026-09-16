@@ -1,0 +1,11 @@
+{
+	"luci-app-mr1500x": {
+		"description": "Grant access to MR1500X LED and button configuration",
+		"read": {
+			"uci": [ "system" ]
+		},
+		"write": {
+			"uci": [ "system" ]
+		}
+	}
+}

@@ -1,0 +1,13 @@
+{
+	"admin/system/hardware": {
+		"title": "LEDs & Buttons",
+		"order": 60,
+		"action": {
+			"type": "view",
+			"path": "mr1500x/hardware"
+		},
+		"depends": {
+			"acl": [ "luci-app-mr1500x" ]
+		}
+	}
+}

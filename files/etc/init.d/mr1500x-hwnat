@@ -1,0 +1,81 @@
+#!/bin/sh /etc/rc.common
+# MR1500X / MR60Xv2 — hardware NAT / fastpath offload.
+#
+# WHAT THIS IS WORTH (measured A/B on the live box):
+#   hw_nat default (off):  ~39 Mbps routed, CPU 69-87% softirq
+#   hw_nat = 1:            ~74 Mbps routed, CPU 100% IDLE, 0% softirq
+# The engine was in the kernel all along — stock's /etc/init.d/network writes
+# /proc/hw_nat at boot and our image simply never did. That one write is the
+# entire delta.
+#
+# /proc/hw_nat values, taken from the stock scripts:
+#   0  off                     (stock uses this when the LAN mask is not /24)
+#   1  NAT / router mode       (stock: router mode + 255.255.255.0)
+#   2  AP / repeater L2 accel  (stock sbin/switch_init)
+#   8  flush                   (stock etc/hotplug.d/iface/01-hwnat, on ifdown)
+#
+# Why the mask matters: the L34 engine classifies the LAN by a /24 netif entry,
+# so stock refuses hardware NAT on any other prefix rather than mis-route. The
+# 'auto' mode below reproduces that check instead of trusting it blindly.
+#
+# COEXISTENCE WITH THE FIREWALL is by design (CONFIG_RTL_IPTABLES_FAST_PATH):
+# the capture hooks live inside nf_nat_core, so only flows that already passed
+# fw3 are offered to hardware — first packets take the slow path, blocked flows
+# are never offloaded. Verified with fw3-managed rules.
+#
+# CAVEAT: offloaded packets bypass per-packet features. Anything doing QoS,
+# traffic shaping, marking or accounting will NOT see them (stock disables
+# hw-nat entirely while QoS is on). Already-offloaded flows also keep their
+# hardware entry after a firewall change until they expire or are flushed
+# (`echo 8 >/proc/hw_nat`, or `echo 2 >/proc/fast_nat` to flush conntrack).
+#
+# Config: /etc/config/mr1500x-hw.
+
+START=21
+
+HW_NAT=/proc/hw_nat
+
+hwnat_mode() {
+	local enabled mode mask
+
+	config_load mr1500x-hw
+	config_get_bool enabled hwnat enabled 1
+	config_get mode hwnat mode auto
+
+	[ "$enabled" = 1 ] || { echo 0; return; }
+
+	case "$mode" in
+	0|1|2)	echo "$mode"; return ;;
+	esac
+
+	# auto: mirror stock — hardware NAT only on a /24 LAN.
+	config_load network
+	config_get mask lan netmask
+	[ "$mask" = "255.255.255.0" ] && echo 1 || echo 0
+}
+
+hwnat_write() {	# $1 = value
+	[ -e "$HW_NAT" ] || {
+		logger -t hwnat "$HW_NAT missing — kernel has no hw-nat capture layer"
+		return 1
+	}
+	echo "$1" >"$HW_NAT" 2>/dev/null ||
+		logger -t hwnat "write '$1' to $HW_NAT failed"
+}
+
+start() {
+	local m
+	m="$(hwnat_mode)"
+	hwnat_write "$m" && logger -t hwnat "hw_nat=$m"
+}
+
+stop() {
+	# 8 = flush the hardware flow table, then leave the engine off.
+	hwnat_write 8
+	hwnat_write 0
+	return 0
+}
+
+reload() {
+	start
+}

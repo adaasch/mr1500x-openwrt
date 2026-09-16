@@ -1,0 +1,17 @@
+# MR1500X / MR60Xv2 — hardware offload knobs. Applied by
+# /etc/init.d/mr1500x-hwnat (S21, after network) and re-applied on wan
+# ifup/ifdown by /etc/hotplug.d/iface/30-hwnat.
+#
+#   enabled  0|1   master switch. 0 also flushes the hardware flow table.
+#   mode     auto  reproduce stock: hw_nat=1 on a /24 LAN, 0 otherwise
+#            0     off
+#            1     NAT / router mode        (the fast one: see HWNAT.md)
+#            2     AP / repeater L2 accel
+#
+# Turn this OFF if you ever add QoS, traffic shaping or per-packet accounting:
+# offloaded flows bypass the net stack entirely and those features will not
+# see them. Stock does the same thing (sync_hnat_status vs QoS).
+
+config hwnat 'hwnat'
+	option enabled	'1'
+	option mode	'auto'

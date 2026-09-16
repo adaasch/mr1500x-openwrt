@@ -1,0 +1,7 @@
+# build_image.sh writes everything under its --workdir (default ./build-mr1500x)
+# and caches downloads under --cache. Neither belongs in the repo: the whole
+# point of the kit is that they are reproducible from what IS here.
+build-mr1500x/
+downloads/
+__pycache__/
+*.pyc

@@ -1,0 +1,25 @@
+No host keys are shipped in this image — they are generated on first boot.
+
+WHY THIS CHANGED
+Early images baked in a pre-generated pair because the rootfs was a read-only
+squashfs with NO overlay: dropbear's boot-time keygen
+(hk_generate_as_needed -> mkdir /etc/dropbear + dropbearkey) had nowhere to
+write, so it failed and :22 was refused. Since v6 the overlay is a real,
+bounded MTD partition ("rootfs_data"), so /etc/dropbear is writable and the
+stock /etc/init.d/dropbear generates ed25519/ecdsa/rsa keys itself if they are
+missing or unreadable — which is what should happen.
+
+Baked-in host keys are identical on every unit built from an image, so SSH host
+key verification proves nothing about which box you reached, and anyone with
+the image has the private keys. Do not put them back.
+
+Consequences worth knowing:
+- first boot after a fresh flash takes noticeably longer (RSA keygen on a
+  4.4-era MIPS core), and :22 only opens once that finishes; :23 (shd) is up
+  immediately either way;
+- the keys live in the overlay, so `sysupgrade` keeps them (the overlay is a
+  separate partition and is never written) while `sysupgrade -n` or a
+  factory reset discards them and the next boot generates a fresh set — your
+  SSH client will warn about a changed host key, correctly.
+
+This directory is kept in the image only so that it exists.

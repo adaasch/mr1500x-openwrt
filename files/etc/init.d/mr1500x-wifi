@@ -1,0 +1,623 @@
+#!/bin/sh /etc/rc.common
+# MR1500X — Wi-Fi bring-up on the vendor kernel (2.4 GHz + 5 GHz).
+#
+# WHY THIS EXISTS INSTEAD OF netifd/wifi
+#   OpenWrt's /lib/netifd/wireless/mac80211.sh calls `iw phy <phy> interface
+#   add`, which HANGS this driver hard: the box stays pingable but every
+#   service dies, and a REBOOT DOES NOT CLEAR IT — only a power cycle does.
+#   So upstream's mac80211.sh is NOT SHIPPED: /lib/netifd/wireless/mac80211.sh
+#   is our reporting-only replacement, which never touches the hardware, and
+#   this script drives the PRE-CREATED netdevs directly the way the vendor
+#   firmware does. (Until v16 the radios were instead kept `disabled '1'` in
+#   /etc/config/wireless. That also kept netifd away — and left
+#   `ubus call network.wireless status` empty, which is the ONLY place LuCI
+#   reads wireless state from, so the UI showed nothing while the APs were on
+#   the air. The invariant is the CONTENT of mac80211.sh, not the radio flag.)
+#
+# THE TWO BANDS ARE DIFFERENT CHIPS AND DIFFERENT DRIVERS
+#   2.4 GHz  phy0 / wlan1*  rtl8192cd   (in-SoC, RTL8197F)
+#   5 GHz    phy1 / wlan0*  rtk_wifi6   (RTL8832BR on PCIe, 5 GHz only)
+#   Note the inversion: wlan1 is 2.4 GHz, wlan0 is 5 GHz.
+#
+# Each needs a different arming step:
+#   2.4 GHz — the ROOT interface must be opened before any vap, and `func_off`
+#             must be cleared or every data frame is silently dropped.
+#   5 GHz   — NEVER pre-up the interface (tuning with no channel plan spins the
+#             LCK loop and a later AP start hangs the box). Write the country
+#             into the driver, set the MAC while down, and let hostapd open it.
+#             The RF tables in /etc/conf/rtl8832bre/RFE50/ are MANDATORY: this
+#             is an eFEM board (rfe_type >= 50) whose radio register tables are
+#             loaded from the filesystem, not compiled into the driver. Without
+#             them the synthesizer never locks and 5 GHz is dead.
+#
+# /usr/sbin/wpad carries 900-rtl8192cd-sta-assoc-reply.patch, without which no
+# client can associate on 2.4 GHz at all.
+
+START=35
+STOP=89
+
+GLOBAL=/var/run/hostapd/global
+
+# mr1500x_wifi_mac(): per-unit radio MACs read from the factory tail, so no
+# image ever ships a MAC constant. Shared with /etc/init.d/vendor-mac.
+. /lib/functions/mr1500x-mac.sh
+
+wait_global() {
+	local i=0
+	while [ ! -S "$GLOBAL" ] && [ "$i" -lt 30 ]; do sleep 1; i=$((i + 1)); done
+	[ -S "$GLOBAL" ]
+}
+
+# The 802.11r block, shared by every AKM that can carry it. Reads the FT_*
+# globals set by start_radio. ft_psk_generate_local=1 derives the key hierarchy
+# locally, which is what makes FT work between this box's own two BSSes without
+# an external key holder (no r0kh/r1kh lists needed).
+# RSN pairwise cipher. SAE and OWE are CCMP-only by spec, so they do not call
+# this — only the PSK AKMs let the operator choose.
+emit_rsn_pairwise() {
+	case "$OPT_CIPHER" in
+		*tkip*ccmp*|auto) echo "rsn_pairwise=TKIP CCMP" ;;
+		*ccmp*)           echo "rsn_pairwise=CCMP" ;;
+		*tkip*)           echo "rsn_pairwise=TKIP" ;;
+		*)                echo "rsn_pairwise=CCMP" ;;
+	esac
+}
+
+emit_ft_lines() {
+	echo "mobility_domain=$FT_MD"
+	echo "ft_psk_generate_local=$FT_LOCAL"
+	echo "ft_over_ds=$FT_OVER_DS"
+	echo "reassociation_deadline=$FT_DEADLINE"
+	echo "nas_identifier=$FT_NAS"
+}
+
+# write_conf <file> <ifname> <bridge> <ssid> <country> <mode> <channel> \
+#            <htmode> <enc> <key>
+write_conf() {
+	local f="$1" ifname="$2" bridge="$3" ssid="$4" country="$5"
+	local mode="$6" channel="$7" htmode="$8" enc="$9" key="${10}"
+
+	umask 077
+	{
+		echo "interface=$ifname"
+		[ -n "$bridge" ] && echo "bridge=$bridge"
+		echo "driver=nl80211"
+		echo "ctrl_interface=/var/run/hostapd"
+		echo "ssid=$ssid"
+		echo "country_code=$country"
+		echo "ieee80211d=1"
+		echo "hw_mode=$mode"
+		echo "channel=$channel"
+		echo "ieee80211n=1"
+		[ "$mode" = "a" ] && echo "ieee80211ac=1"
+		case "$htmode" in
+			HT40+) echo "ht_capab=[HT40+][SHORT-GI-20][SHORT-GI-40]" ;;
+			HT40-) echo "ht_capab=[HT40-][SHORT-GI-20][SHORT-GI-40]" ;;
+		esac
+		[ "$mode" = "a" ] && echo "vht_oper_chwidth=0"
+		# WMM is required for 802.11n rates; only override it if asked.
+		if [ -n "$OPT_WMM" ]; then
+			echo "wmm_enabled=$OPT_WMM"
+		else
+			echo "wmm_enabled=1"
+		fi
+		echo "auth_algs=1"
+
+		# Optional per-BSS directives. Each is emitted ONLY when set, so an
+		# unticked/cleared field in LuCI leaves hostapd's own default in place
+		# rather than pinning it to something we invented.
+		[ -n "$OPT_HIDDEN" ]    && echo "ignore_broadcast_ssid=$OPT_HIDDEN"
+		[ -n "$OPT_ISOLATE" ]   && echo "ap_isolate=$OPT_ISOLATE"
+		[ -n "$OPT_DTIM" ]      && echo "dtim_period=$OPT_DTIM"
+		[ -n "$OPT_BEACON" ]    && echo "beacon_int=$OPT_BEACON"
+		[ -n "$OPT_MAXINACT" ]  && echo "ap_max_inactivity=$OPT_MAXINACT"
+		[ -n "$OPT_DISASSOC" ]  && echo "disassoc_low_ack=$OPT_DISASSOC"
+		[ -n "$OPT_SKIPPOLL" ]  && echo "skip_inactivity_poll=$OPT_SKIPPOLL"
+		[ -n "$OPT_MAXLISTEN" ] && echo "max_listen_interval=$OPT_MAXLISTEN"
+		[ -n "$OPT_RTS" ]       && echo "rts_threshold=$OPT_RTS"
+		[ -n "$OPT_FRAG" ]      && echo "fragm_threshold=$OPT_FRAG"
+		[ -n "$OPT_PREAMBLE" ]  && echo "preamble=$OPT_PREAMBLE"
+
+		# MAC ACL. hostapd's polarity is the opposite of what the names suggest:
+		# macaddr_acl=1 means "deny everyone except accept_mac_file", =0 means
+		# "allow everyone except deny_mac_file".
+		case "$OPT_MACFILTER" in
+			allow)
+				echo "macaddr_acl=1"
+				echo "accept_mac_file=$OPT_MACLIST_FILE"
+				;;
+			deny)
+				echo "macaddr_acl=0"
+				echo "deny_mac_file=$OPT_MACLIST_FILE"
+				;;
+		esac
+		# AKM selection. WPA3-SAE and OWE are supported by this hardware — the
+		# recipes below are lifted from the STOCK firmware's own
+		# lib/wifi/hostapd.sh (`psk_sae` / `owe` branches), so they are what the
+		# vendor drives this driver with, not a guess. An earlier version of
+		# this file claimed "WPA/WPA2-PSK only"; that was an assumption about
+		# the 2.4 GHz driver's age, never measured, and it was wrong.
+		#
+		# Order matters: sae-mixed* before sae*, psk2*/psk-mixed* before psk*.
+		# LuCI writes values like "psk2+ccmp" / "sae-mixed".
+		#
+		# FT_* are set by start_radio just before this call (same shell) rather
+		# than passed positionally — write_conf is already at ${10}. 802.11r
+		# needs RSN, so it only rides on the wpa=2 AKMs.
+		case "$enc" in
+			none|open)
+				;;
+			sae-mixed*)
+				# WPA3-SAE / WPA2-PSK transition mode. ieee80211w=1 (optional
+				# MFP) so WPA2-only clients can still associate.
+				echo "wpa=2"
+				if [ "$FT_ENABLE" = "1" ]; then
+					echo "wpa_key_mgmt=SAE WPA-PSK FT-SAE FT-PSK"
+					emit_ft_lines
+				else
+					echo "wpa_key_mgmt=SAE WPA-PSK"
+				fi
+				echo "rsn_pairwise=CCMP"
+				echo "ieee80211w=1"
+				echo "wpa_passphrase=$key"
+				;;
+			sae*)
+				# WPA3 only. SAE mandates MFP, hence ieee80211w=2.
+				echo "wpa=2"
+				if [ "$FT_ENABLE" = "1" ]; then
+					echo "wpa_key_mgmt=SAE FT-SAE"
+					emit_ft_lines
+				else
+					echo "wpa_key_mgmt=SAE"
+				fi
+				echo "rsn_pairwise=CCMP"
+				echo "ieee80211w=2"
+				echo "wpa_passphrase=$key"
+				;;
+			owe*)
+				echo "wpa=2"
+				echo "wpa_key_mgmt=OWE"
+				echo "rsn_pairwise=CCMP"
+				echo "ieee80211w=2"
+				;;
+			psk2*)
+				echo "wpa=2"
+				if [ "$FT_ENABLE" = "1" ]; then
+					echo "wpa_key_mgmt=WPA-PSK FT-PSK"
+					emit_ft_lines
+				else
+					echo "wpa_key_mgmt=WPA-PSK"
+				fi
+				emit_rsn_pairwise
+				echo "wpa_passphrase=$key"
+				;;
+			psk-mixed*)
+				echo "wpa=3"
+				echo "wpa_key_mgmt=WPA-PSK"
+				echo "wpa_pairwise=TKIP CCMP"
+				emit_rsn_pairwise
+				echo "wpa_passphrase=$key"
+				;;
+			psk*)
+				echo "wpa=1"
+				echo "wpa_key_mgmt=WPA-PSK"
+				echo "wpa_pairwise=TKIP CCMP"
+				echo "wpa_passphrase=$key"
+				;;
+			*)
+				# The EAP modes need a RADIUS server (auth_server_addr/port/
+				# secret), which nothing here collects yet, and WEP is dead.
+				echo "mr1500x-wifi: encryption '$enc' is not wired up yet (EAP needs a RADIUS server) — falling back to WPA2-PSK" >&2
+				echo "wpa=2"
+				echo "wpa_key_mgmt=WPA-PSK"
+				echo "rsn_pairwise=CCMP"
+				echo "wpa_passphrase=$key"
+				;;
+		esac
+
+		# Group rekey interval — only meaningful once WPA is on at all.
+		case "$enc" in
+			none|open) ;;
+			*) [ -n "$OPT_GROUPREKEY" ] && echo "wpa_group_rekey=$OPT_GROUPREKEY" ;;
+		esac
+	} > "$f"
+}
+
+start_radio() {
+	local sec="$1" band="$2"
+	local enabled ifname phy ssid key enc channel country macaddr bridge htmode
+	local conf mode
+
+	config_get_bool enabled "$sec" enabled 1
+	[ "$enabled" = "1" ] || { echo "mr1500x-wifi: $sec disabled"; return 0; }
+
+	config_get ifname  "$sec" ifname
+	config_get phy     "$sec" phy
+	config_get ssid    "$sec" ssid    MR1500X
+	config_get key     "$sec" key     ''
+	config_get enc     "$sec" encryption psk2
+	config_get channel "$sec" channel
+	config_get country "$sec" country DE
+	# *** NO MAC CONSTANT IN THE CONFIG ***
+	# An `option macaddr` is honoured if someone sets one, but the shipped
+	# config MUST NOT carry one: it would be the build unit's address on every
+	# other device that flashes the image (duplicate MACs on the air, and a
+	# nas_identifier that is no longer unique). Absent = derive from THIS
+	# unit's factory tail. See /lib/functions/mr1500x-mac.sh.
+	config_get macaddr "$sec" macaddr ''
+	[ -n "$macaddr" ] || macaddr=$(mr1500x_wifi_mac "$ifname")
+	[ -n "$macaddr" ] || \
+		echo "mr1500x-wifi: no factory MAC for $ifname — leaving the driver default"
+	config_get bridge  "$sec" bridge  br-lan
+	config_get htmode  "$sec" htmode  ''
+
+	[ -n "$ifname" ] && [ -n "$phy" ] || return 0
+	conf="/var/run/mr1500x-$sec.conf"
+
+	# 802.11r (Fast Transition). Only meaningful with WPA2 (RSN); write_conf
+	# ignores these unless the encryption is psk2*. ft_psk_generate_local=1
+	# derives the key hierarchy locally, so no r0kh/r1kh lists are needed —
+	# that is what makes FT usable between this box's own two BSSes without an
+	# external key holder.
+	config_get_bool FT_ENABLE   "$sec" ieee80211r 0
+	config_get      FT_MD       "$sec" mobility_domain '4f57'
+	config_get_bool FT_OVER_DS  "$sec" ft_over_ds 1
+	config_get_bool FT_LOCAL    "$sec" ft_psk_generate_local 1
+	config_get      FT_DEADLINE "$sec" reassociation_deadline '1000'
+	# hostapd needs an R0KH-ID; the radio's own MAC is unique and stable.
+	FT_NAS=$(echo "$macaddr" | tr -d ':')
+	[ -n "$FT_NAS" ] || FT_NAS="$ifname"
+
+	# Optional per-BSS settings. Empty means "not set" -> write_conf omits the
+	# directive entirely and hostapd's own default applies, which is what LuCI
+	# unticking/clearing a field should mean.
+	config_get OPT_HIDDEN     "$sec" hidden ''
+	config_get OPT_ISOLATE    "$sec" isolate ''
+	config_get OPT_WMM        "$sec" wmm ''
+	config_get OPT_DTIM       "$sec" dtim_period ''
+	config_get OPT_BEACON     "$sec" beacon_int ''
+	config_get OPT_MAXINACT   "$sec" max_inactivity ''
+	config_get OPT_DISASSOC   "$sec" disassoc_low_ack ''
+	config_get OPT_SKIPPOLL   "$sec" skip_inactivity_poll ''
+	config_get OPT_MAXLISTEN  "$sec" max_listen_interval ''
+	config_get OPT_RTS        "$sec" rts ''
+	config_get OPT_FRAG       "$sec" frag ''
+	config_get OPT_PREAMBLE   "$sec" short_preamble ''
+	config_get OPT_GROUPREKEY "$sec" wpa_group_rekey ''
+	config_get OPT_CIPHER     "$sec" cipher ''
+	config_get OPT_MACFILTER  "$sec" macfilter ''
+	config_get OPT_MACLIST    "$sec" maclist ''
+	OPT_MACLIST_FILE="/var/run/mr1500x-$sec.maclist"
+
+	# hostapd reads the ACL from a file, one MAC per line. Written here rather
+	# than inside write_conf so the config heredoc stays a pure stdout stream.
+	case "$OPT_MACFILTER" in
+		allow|deny)
+			: > "$OPT_MACLIST_FILE"
+			for m in $OPT_MACLIST; do echo "$m" >> "$OPT_MACLIST_FILE"; done
+			;;
+	esac
+
+	if [ "$band" = "5g" ]; then
+		mode=a
+		# The RF register tables are loaded from the rootfs on this eFEM
+		# board. No tables -> the synthesizer never locks -> dead radio.
+		[ -f /etc/conf/rtl8832bre/RFE50/RadioA.txt ] || {
+			echo "mr1500x-wifi: MISSING /etc/conf/rtl8832bre/RFE50 RF tables — 5 GHz cannot work"
+			return 1
+		}
+		# Program the country/channel plan into the driver directly
+		# (rtw_set_country -> chplan). hostapd's country_code alone does
+		# not reach this path.
+		[ -w /proc/net/rtk_wifi6/$ifname/country_code ] &&
+			echo "$country" > /proc/net/rtk_wifi6/$ifname/country_code
+		# MAC must be set while the interface is DOWN, and we must NOT
+		# bring it up here — hostapd opens it with a channel configured.
+		[ -n "$macaddr" ] && ip link set "$ifname" address "$macaddr" 2>/dev/null
+	else
+		mode=g
+		[ -n "$macaddr" ] && ip link set "$ifname" address "$macaddr" 2>/dev/null
+		# The ROOT interface must be opened before any vap on this phy.
+		ip link set "$ifname" up || {
+			echo "mr1500x-wifi: cannot bring up $ifname"; return 1; }
+		sleep 3
+		# func_off defaults to 1 on the vaps and silently drops every data
+		# frame (8192cd_tx.c). Must be written BEFORE the ADD.
+		iwpriv "$ifname" set_mib func_off=0 >/dev/null 2>&1
+	fi
+
+	write_conf "$conf" "$ifname" "$bridge" "$ssid" "$country" "$mode" \
+		"$channel" "$htmode" "$enc" "$key"
+
+	if hapcli "$GLOBAL" ADD "bss_config=$phy:$conf" >/dev/null 2>&1; then
+		echo "mr1500x-wifi: '$ssid' up on $ifname ($phy, ch $channel)"
+	else
+		echo "mr1500x-wifi: ADD failed for $ifname ($phy)"
+		return 1
+	fi
+}
+
+# LuCI reads wireless state ONLY from netifd, and netifd ran its wireless setup
+# back at S20 — long before these netdevs were up, so it saw nothing to report.
+# Ask it to run that setup again now that the radios are live, or LuCI shows the
+# radios with no interfaces on them. This is free: our netifd driver
+# (/lib/netifd/wireless/mr1500x.sh) only OBSERVES — it starts and stops nothing.
+refresh_netifd_wireless() {
+	# hostapd's ADD returns once the BSS is up, but give the netdev flags a
+	# moment to settle before netifd samples them.
+	sleep 2
+	# A down/up cycle is required: `network.wireless reconf` does NOT re-run
+	# the setup script (verified on hardware — after reconf the vif list was
+	# still empty, after down/up it was populated). This is safe here only
+	# because our driver's teardown is a no-op and its vifs carry no
+	# `option network`, so netifd touches no interface and no bridge.
+	ubus -t 10 call network.wireless down >/dev/null 2>&1
+	sleep 2
+	ubus -t 10 call network.wireless up >/dev/null 2>&1
+	# netifd runs the setup script asynchronously, so without this the state is
+	# briefly empty after an apply and LuCI shows nothing until its next poll.
+	sleep 3
+	return 0
+}
+
+# --- LuCI "Save & Apply" support -------------------------------------------
+#
+# LuCI edits /etc/config/wireless. That file stays the UI front-end and
+# /etc/config/mr1500x-wifi stays the authority (it is what start() reads), so
+# reload() mirrors the editable fields across and then applies them live.
+# /etc/config/ucitrack has `option init mr1500x-wifi` under `config wireless`,
+# which is what makes LuCI's apply call us at all.
+#
+# Restarting a BSS in place is safe: verified on hardware 2026-09-04, two
+# REMOVE->ADD cycles per radio in one boot, all rc=0, clients re-associating
+# afterwards and the uplink on the shared phy0 keeping its DHCP lease
+# throughout. The old "one hostapd start per boot" note was an
+# over-generalisation from early bring-up; it does not apply to this path.
+
+# Signature of everything that would change a generated hostapd config. Written
+# whenever a radio is applied, so reload() can restart ONLY what actually
+# changed instead of bouncing both radios on every apply.
+# Fields mirrored from /etc/config/wireless (the LuCI-facing file) into this
+# unit's authority. They are split by rule, and the split matters:
+#
+#   SEED_OPTS  absent means "the UI file was never seeded" -> do NOT overwrite.
+#              These are the ones the image deliberately ships empty
+#              (credentials). publish_radio_to_wireless fills them in on boot.
+#   FLAG_OPTS  absent means "off / use the default" -> copy-or-delete. LuCI
+#              DELETES a boolean option when you untick it, so anything treated
+#              as SEED here could never be switched back off from the UI.
+SEED_OPTS="ssid key encryption"
+FLAG_OPTS="ieee80211r mobility_domain ft_over_ds ft_psk_generate_local
+	reassociation_deadline hidden isolate wmm dtim_period beacon_int
+	max_inactivity disassoc_low_ack skip_inactivity_poll max_listen_interval
+	rts frag short_preamble wpa_group_rekey cipher macfilter maclist"
+# Device-level (wifi-device section) fields.
+DEV_OPTS="channel htmode country"
+
+# Everything that can change a generated hostapd config. Derived from the lists
+# above so adding a setting in one place cannot silently skip change detection.
+radio_sig() {
+	local s="mr1500x-wifi.$1" v out=""
+
+	for v in enabled $DEV_OPTS $SEED_OPTS $FLAG_OPTS; do
+		out="$out|$(uci -q get "$s.$v")"
+	done
+	echo "$out"
+}
+
+# The AP wifi-iface bound to a wifi-device. Matches on mode=ap as well, not just
+# on device=radioN: the uplink's sta section sits on radio0 too, and matching
+# only the device would sync the uplink's SSID into the AP config.
+ap_iface_for() {
+	local dev="$1" i
+
+	for i in $(uci -q show wireless | sed -n "s/^wireless\.\([^.]*\)\.device='$dev'\$/\1/p"); do
+		[ "$(uci -q get "wireless.$i.mode")" = "ap" ] && { echo "$i"; return 0; }
+	done
+	return 1
+}
+
+# The image ships the AP passphrase in /etc/config/mr1500x-wifi only (it is not
+# duplicated into /etc/config/wireless), so LuCI's password field would come up
+# blank and saving the form could wipe a working key. Publish it once, using the
+# same unset-vs-empty rule as the uplink: absent means "never seeded", empty
+# means "the operator cleared it".
+publish_radio_to_wireless() {
+	local dev="$1" sec="$2" iface v
+
+	iface=$(ap_iface_for "$dev") || return 0
+	uci -q get "wireless.$iface.key" >/dev/null 2>&1 && return 0
+	v=$(uci -q get "mr1500x-wifi.$sec.key")
+	[ -n "$v" ] || return 0
+	uci -q set "wireless.$iface.key=$v"
+	uci -q commit wireless
+}
+
+# Copy the fields LuCI can edit from /etc/config/wireless into the authority.
+# $1 = wifi-device section (radio0), $2 = our section (radio2g)
+sync_from_wireless() {
+	local dev="$1" sec="$2"
+	local iface v
+
+	iface=$(ap_iface_for "$dev")
+
+	for v in $DEV_OPTS; do
+		uci -q get "wireless.$dev.$v" >/dev/null 2>&1 &&
+			uci -q set "mr1500x-wifi.$sec.$v=$(uci -q get "wireless.$dev.$v")"
+	done
+	# `disabled` in /etc/config/wireless is the inverse of our `enabled`
+	if [ "$(uci -q get "wireless.$dev.disabled")" = "1" ]; then
+		uci -q set "mr1500x-wifi.$sec.enabled=0"
+	else
+		uci -q set "mr1500x-wifi.$sec.enabled=1"
+	fi
+	[ -n "$iface" ] || return 0
+	for v in $SEED_OPTS; do
+		uci -q get "wireless.$iface.$v" >/dev/null 2>&1 &&
+			uci -q set "mr1500x-wifi.$sec.$v=$(uci -q get "wireless.$iface.$v")"
+	done
+
+	for v in $FLAG_OPTS; do
+		if uci -q get "wireless.$iface.$v" >/dev/null 2>&1; then
+			uci -q set "mr1500x-wifi.$sec.$v=$(uci -q get "wireless.$iface.$v")"
+		else
+			# drop it so start_radio's built-in default applies again
+			uci -q delete "mr1500x-wifi.$sec.$v" 2>/dev/null
+		fi
+	done
+}
+
+# --- the client uplink (sta) -----------------------------------------------
+#
+# The uplink is run by /etc/init.d/mr1500x-wwan (wpa_supplicant), not by
+# hostapd, so it is applied by restarting that service rather than by touching a
+# BSS. Its credentials are NEVER in the image: the shipped wwan section in
+# /etc/config/wireless has no ssid and no key at all.
+#
+# That creates one trap worth being explicit about. "unset" and "empty" are
+# DIFFERENT here:
+#   unset  (no `option ssid` line)  = the UI file has never been seeded, so
+#                                     publish the device's real config into it
+#   empty  (`option ssid ''`)       = someone cleared it in LuCI, meaning
+#                                     "turn the uplink off"
+# Treating the first as the second would wipe a working uplink — and on a unit
+# reached THROUGH that uplink, that is a self-inflicted lockout.
+wwan_sig() {
+	local s="mr1500x-wifi.wwan"
+	echo "$(uci -q get $s.enabled)|$(uci -q get $s.ssid)|$(uci -q get $s.key)|$(uci -q get $s.encryption)"
+}
+
+publish_wwan_to_wireless() {
+	local ssid key enc en
+
+	# already seeded (even to an empty string) -> the UI file wins from here on
+	uci -q get wireless.wwan.ssid >/dev/null 2>&1 && return 0
+
+	ssid=$(uci -q get mr1500x-wifi.wwan.ssid)
+	key=$(uci -q get mr1500x-wifi.wwan.key)
+	enc=$(uci -q get mr1500x-wifi.wwan.encryption)
+	en=$(uci -q get mr1500x-wifi.wwan.enabled)
+
+	uci -q set wireless.wwan.ssid="$ssid"
+	uci -q set wireless.wwan.key="$key"
+	[ -n "$enc" ] && uci -q set wireless.wwan.encryption="$enc"
+	if [ "$en" = "1" ]; then
+		uci -q set wireless.wwan.disabled=0
+	else
+		uci -q set wireless.wwan.disabled=1
+	fi
+	uci -q commit wireless
+}
+
+sync_wwan_from_wireless() {
+	local ssid key enc dis
+
+	uci -q get wireless.wwan.ssid >/dev/null 2>&1 || return 0
+
+	ssid=$(uci -q get wireless.wwan.ssid)
+	key=$(uci -q get wireless.wwan.key)
+	enc=$(uci -q get wireless.wwan.encryption)
+	dis=$(uci -q get wireless.wwan.disabled)
+
+	uci -q set mr1500x-wifi.wwan.ssid="$ssid"
+	uci -q set mr1500x-wifi.wwan.key="$key"
+	[ -n "$enc" ] && uci -q set mr1500x-wifi.wwan.encryption="$enc"
+	# `enabled` is derived, not copied: an uplink with no ssid has nothing to
+	# join, and an explicitly disabled section must stay down.
+	if [ -n "$ssid" ] && [ "$dis" != "1" ]; then
+		uci -q set mr1500x-wifi.wwan.enabled=1
+	else
+		uci -q set mr1500x-wifi.wwan.enabled=0
+	fi
+}
+
+# REMOVE the BSS, then let start_radio do the arming and the ADD again — the
+# arming differs per band and start_radio is the proven version of it.
+restart_radio() {
+	local sec="$1" band="$2" ifname
+	config_get ifname "$sec" ifname
+	[ -n "$ifname" ] || return 0
+	hapcli "$GLOBAL" REMOVE "$ifname" >/dev/null 2>&1
+	sleep 3
+	start_radio "$sec" "$band"
+}
+
+reload() {
+	local sec band old new any=0
+
+	publish_radio_to_wireless radio0 radio2g
+	publish_radio_to_wireless radio1 radio5g
+	publish_wwan_to_wireless
+	sync_from_wireless radio0 radio2g
+	sync_from_wireless radio1 radio5g
+	sync_wwan_from_wireless
+	uci -q commit mr1500x-wifi
+
+	wait_global || { echo "mr1500x-wifi: no global hostapd at $GLOBAL"; return 1; }
+	config_load mr1500x-wifi
+
+	for sec in radio2g radio5g; do
+		[ "$sec" = radio2g ] && band=2g || band=5g
+		new="$(radio_sig "$sec")"
+		old="$(cat "/var/run/mr1500x-$sec.sig" 2>/dev/null)"
+		[ "$new" = "$old" ] && continue
+		echo "mr1500x-wifi: $sec changed — restarting BSS"
+		restart_radio "$sec" "$band"
+		echo "$new" > "/var/run/mr1500x-$sec.sig"
+		any=1
+	done
+
+	# The uplink is a different service (wpa_supplicant), so it is applied by
+	# restarting it, not by touching a BSS. mr1500x-wwan refreshes netifd itself
+	# once it has associated.
+	new="$(wwan_sig)"
+	old="$(cat /var/run/mr1500x-wwan.sig 2>/dev/null)"
+	if [ "$new" != "$old" ]; then
+		echo "mr1500x-wifi: uplink changed — restarting mr1500x-wwan"
+		echo "$new" > /var/run/mr1500x-wwan.sig
+		# NOTE: if you are reaching this box THROUGH the uplink, this drops
+		# your own connection. A wrong passphrase here does not come back.
+		/etc/init.d/mr1500x-wwan restart
+	fi
+
+	[ "$any" = 1 ] && refresh_netifd_wireless
+	return 0
+}
+
+start() {
+	config_load mr1500x-wifi
+	wait_global || { echo "mr1500x-wifi: no global hostapd at $GLOBAL"; return 1; }
+	start_radio radio2g 2g
+	start_radio radio5g 5g
+	radio_sig radio2g > /var/run/mr1500x-radio2g.sig
+	radio_sig radio5g > /var/run/mr1500x-radio5g.sig
+	# Make LuCI show what this unit is actually configured with — the image
+	# ships the AP passphrase and the whole uplink section blank — and record
+	# the signatures so the first reload after boot restarts nothing.
+	publish_radio_to_wireless radio0 radio2g
+	publish_radio_to_wireless radio1 radio5g
+	publish_wwan_to_wireless
+	wwan_sig > /var/run/mr1500x-wwan.sig
+	refresh_netifd_wireless
+}
+
+stop() {
+	local ifname sec
+
+	config_load mr1500x-wifi
+	# CORRECTED 2026-09-04: this used to warn that the drivers tolerate about
+	# one hostapd start per boot and that "after a REMOVE the next ADD tends to
+	# fail until a POWER CYCLE". Tested directly and that is NOT true of this
+	# path: two REMOVE->ADD cycles per radio in one boot all returned rc=0, the
+	# APs came back on air with the new config, a client re-associated, and the
+	# uplink sharing phy0 kept its DHCP lease the whole time. `reload` relies on
+	# this. (The real power-cycle hazard is netifd's `iw phy ... interface add`,
+	# which is a different code path entirely — see the header.)
+	for sec in radio2g radio5g; do
+		config_get ifname "$sec" ifname
+		[ -n "$ifname" ] && [ -S "$GLOBAL" ] &&
+			hapcli "$GLOBAL" REMOVE "$ifname" >/dev/null 2>&1
+		rm -f "/var/run/mr1500x-$sec.conf"
+	done
+	return 0
+}

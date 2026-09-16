@@ -1,0 +1,98 @@
+#!/bin/sh /etc/rc.common
+# MR1500X — apply the real factory MAC address.
+#
+# WHY
+# OpenWrt otherwise comes up with the placeholder 00:12:34:56:78:90 on eth0/eth1
+# (and 0a/0e:00:00:00:00:00 on the wifi phys), because nothing reads the vendor
+# factory data. The real MAC lives in the `default-mac` factory partition, which
+# is INSIDE the kernel's mtd2 "rootfs" partition:
+#
+#   flash 0xfa0000 = mtd2 offset 0xba0000     (partition base is 0x400000)
+#   layout: u32 BE length (=6) | 4 zero bytes | 6 MAC bytes | 0xff padding
+#   so the MAC itself is at mtd2 offset 0xba0008
+#
+# Verified against both the factory dump and the live device: the value read
+# here matches the stock firmware's eth0. (No literal MAC is quoted anywhere in
+# this tree on purpose — every file here ships in the published image, and a
+# build unit's address has no business on someone else's router or in a public
+# download.) Read-only: we only ever *read* mtd2
+# here — writing anywhere near 0xba0000 would destroy unrecoverable factory data
+# (see mtdregion.c for the guarded writer).
+#
+# Derivation observed on stock:
+#   wlan0 (2.4G) = base - 1      (…:47)
+#   eth0 / br-lan = base          (…:48)
+#   eth1 / WAN    = base + 1      (…:49)
+#   wlan1 (5G)    = base with the locally-administered bit set (32:…)
+#
+# Must run before netifd brings up br-lan.
+START=25		# after network (20) so br-lan exists
+
+# The read + derivation live in a lib because /etc/init.d/mr1500x-wifi needs
+# exactly the same arithmetic for the radio MACs, and the copy that used to be
+# in /etc/config/mr1500x-wifi was a hardcoded constant from THIS unit.
+. /lib/functions/mr1500x-mac.sh
+
+read_factory_mac() { mr1500x_read_factory_mac; }
+mac_offset()       { mr1500x_mac_offset "$@"; }
+mac_local()        { mr1500x_mac_local "$@"; }
+
+boot() { start "$@"; }
+
+start() {
+	local base wan wl0 wl1
+	base=$(read_factory_mac)
+
+	case "$base" in
+		"" | "00:00:00:00:00:00" | "ff:ff:ff:ff:ff:ff")
+			logger -t vendor-mac "no usable factory MAC at $MR1500X_MAC_MTD+$MR1500X_MAC_OFF; leaving defaults"
+			return 0
+			;;
+	esac
+
+	wan=$(mac_offset "$base" 1)
+	wl0=$(mac_offset "$base" -1)
+	wl1=$(mac_local "$base")
+
+	logger -t vendor-mac "factory MAC $base (wan $wan, wlan0 $wl0, wlan1 $wl1)"
+
+	# Apply to br-lan ONLY, and ONLY while it is up.
+	# *** NEVER `ifconfig <iface> down` HERE ***
+	# The original version did `ifconfig eth0 down; ... hw ether; ... up` and
+	# that permanently killed the switch link (carrier=0, box unreachable,
+	# physical rescue required). Changing the MAC of a live bridge is safe and
+	# is verified working on-device: br-lan took the factory address with the
+	# link up, IP intact, and the LAN peer's ARP followed it immediately.
+	# eth0/eth1 are deliberately left alone: Linux requires them DOWN for a MAC
+	# change, which is exactly the operation that breaks this hardware.
+	i=0
+	while [ ! -d /sys/class/net/br-lan ] && [ $i -lt 30 ]; do
+		sleep 1; i=$((i + 1))
+	done
+	if [ -d /sys/class/net/br-lan ]; then
+		ifconfig br-lan hw ether "$base" 2>/dev/null \
+			&& logger -t vendor-mac "br-lan MAC set to $base" \
+			|| logger -t vendor-mac "br-lan MAC set FAILED (left as-is)"
+	else
+		logger -t vendor-mac "br-lan never appeared; MAC not applied"
+	fi
+
+	# --- historical note -------------------------------------------------
+	# An earlier version of this script did:
+	#     ifconfig eth0 down; ifconfig eth0 hw ether $base; ifconfig eth0 up
+	# and that KILLED THE ETHERNET LINK permanently (peer NIC carrier=0, no
+	# TFTP, box unreachable, physical rescue required). Downing eth0 on this
+	# vendor driver drops the RTL8367 switch link, and re-asserting
+	# /proc/rtl865x/link from netup does not bring it back — the MAC change
+	# under a live br-lan/eth0.2 bridge compounds it.
+	#
+	# So we only *record* the factory MAC. Applying it must be done from a live
+	# shell where it can be observed and undone, not blindly at boot on a board
+	# with no console. See ROADMAP "Real MAC address".
+	mkdir -p /var/run
+	echo "$base" > /var/run/factory_mac
+	echo "$wl0"  > /var/run/factory_mac_wlan0
+	echo "$wl1"  > /var/run/factory_mac_wlan1
+
+	return 0
+}

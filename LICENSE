@@ -1,0 +1,48 @@
+The files in this kit that were written for this project — everything under
+src/, modules/, files/, tools/ and build_image.sh — are licensed
+under the GNU General Public License, version 2.
+
+    This program is free software; you can redistribute it and/or modify it
+    under the terms of the GNU General Public License version 2 as published by
+    the Free Software Foundation.
+
+    This program is distributed in the hope that it will be useful, but WITHOUT
+    ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+    FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+    more details.
+
+    You should have received a copy of the GNU General Public License along
+    with this program; if not, see <https://www.gnu.org/licenses/gpl-2.0.html>.
+
+GPL-2.0 is not a stylistic choice: modules/rootfs_data_part.c is a Linux kernel
+module and links against GPL-2.0 kernel headers, so it could not be anything
+else. The rest is kept under the same license for consistency.
+
+Third-party components are not covered by the above, are not redistributed in
+this kit, and are fetched from their own sources at build time:
+
+  OpenWrt 21.02.7        github.com/openwrt/openwrt @ 57a6d97ddf8f...
+                         GPL-2.0 and others, per package
+  LuCI                   github.com/openwrt/luci @ e4c46338b196...
+                         Apache-2.0
+  OpenWrt packages feed  git.openwrt.org/feed/packages @ 48242ee7a190...
+                         per package
+  Linux 4.4.176          the Mercusys "GPL Code" drop for the MR60X v2
+                         GPL-2.0
+  hostapd / wpad         part of OpenWrt; patches/900-*.patch applies to it
+                         BSD-3-Clause
+  gpio-button-hotplug    the same GPL drop (originally OpenWrt, by Felix
+                         Fietkau and Gabor Juhos), GPL-2.0
+
+patches/900-rtl8192cd-sta-assoc-reply.patch modifies hostapd and is therefore
+offered under hostapd's own BSD-3-Clause terms, not GPL-2.0.
+
+RF calibration tables (etc/conf/rtl8832bre/RFE50/**, 39 files) are proprietary
+vendor data. They are NOT in this kit and are not redistributed by it:
+build_image.sh extracts them from the official Mercusys firmware image that you
+download yourself. build_image.sh explains which files and why, at the step
+that extracts them.
+
+This project is not affiliated with, endorsed by, or supported by Mercusys or
+TP-Link. Product names are used only to identify the hardware this software
+runs on.

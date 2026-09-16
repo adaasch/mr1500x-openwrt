@@ -1,0 +1,67 @@
+# MR1500X / MR60Xv2 — carve the bounded overlay partition, then let the STOCK
+# OpenWrt mount_root build a normal overlay on it.
+#
+# WHY WE CARVE IT OURSELVES INSTEAD OF LETTING OPENWRT FIND IT
+# mtd2 "rootfs" spans flash 0x400000..0xff0000 and OVERRUNS the factory tail at
+# 0xfa0000 (default-mac, product-info, radio calibration). OpenWrt's stock
+# rootfs_data auto-detection claims everything from the end of the squashfs to
+# the end of the partition — it would format straight over that tail, and those
+# bytes are NOT recoverable, not even by TFTP rescue. So we hand mount_root a
+# partition with an explicit, guarded end and never let it go looking.
+#
+#   flash 0x400000..0xa00000   rootfs squashfs (6 MB budget, ~4.1 MB used)
+#   flash 0xa00000..0xfa0000   this overlay    (mtd2-relative 0x600000, 0x5a0000)
+#   flash 0xfa0000..0x1000000  factory tail    — NEVER TOUCHED
+#
+# rootfs_data_part.ko registers a REAL MTD partition (mtd_add_partition) and
+# refuses in-kernel to reach mtd2-relative 0xba0000.
+#
+# HISTORY — why not block2mtd over a bounded loop device
+# That was the first design and it very nearly worked: the loop lo_sizelimit
+# bounds the window safely and jffs2 mounted fine. But the only block device for
+# this flash is /dev/mtdblock2, and mtdblock caches the current eraseblock in
+# RAM, writing it back only on flush/release. block2mtd holds the device open
+# forever, so the cache was never flushed — settings survived until reboot and
+# then silently vanished. A real MTD partition writes straight to NOR.
+#
+# overlayfs itself is a module: this vendor kernel ships no CONFIG_OVERLAY_FS.
+# Both modules are built from the vendor's own GPL kernel source with their own
+# compiler so vermagic matches.
+#
+# FAIL-SAFE: every step is best-effort and this hook always succeeds. If it
+# fails, "rootfs_data" never appears, stock mount_root falls back to a RAM
+# overlay, and the box boots normally — just without persistence. That matters:
+# this board has no UART, so a boot that dies here would need a physical rescue.
+
+RD_KMOD=/lib/modules/4.4.176
+
+mr1500x_rootfs_data() {
+	grep -q '"rootfs_data"' /proc/mtd 2>/dev/null && return 0
+
+	# overlayfs first — mount_root cannot build the overlay without it
+	[ -e "$RD_KMOD/overlay.ko" ] && insmod "$RD_KMOD/overlay.ko" 2>/dev/null
+
+	# the bounded partition (offset/size defaults are compiled into the module)
+	[ -e "$RD_KMOD/rootfs_data_part.ko" ] && \
+		insmod "$RD_KMOD/rootfs_data_part.ko" 2>/dev/null
+
+	# *** RACE: the /dev nodes appear slightly AFTER the MTD registers. ***
+	# mount_root runs milliseconds later and opens /dev/mtdN by index; on the
+	# first attempt it lost that race and logged
+	#   mount_root: Could not open mtd device: /dev/mtd4
+	#   mount_root: reading rootfs_data failed
+	# so the overlay was silently skipped. Don't sleep and hope — the numbers
+	# are fixed by the kernel (mtd char major 90 minor 2N, mtdblock major 31
+	# minor N), so create them ourselves if they are not there yet.
+	idx=$(sed -n 's/^mtd\([0-9]*\):.*"rootfs_data".*$/\1/p' /proc/mtd 2>/dev/null | head -1)
+	[ -n "$idx" ] || return 0
+	[ -e "/dev/mtd$idx" ]      || mknod "/dev/mtd$idx"      c 90 $((idx * 2)) 2>/dev/null
+	[ -e "/dev/mtdblock$idx" ] || mknod "/dev/mtdblock$idx" b 31 "$idx"       2>/dev/null
+
+	return 0
+}
+
+# Registered into preinit_main BEFORE 80_mount_root's do_mount_root: preinit
+# sources /lib/preinit/* in lexical order and hooks run in registration order,
+# so 79_* is guaranteed to run first.
+boot_hook_add preinit_main mr1500x_rootfs_data

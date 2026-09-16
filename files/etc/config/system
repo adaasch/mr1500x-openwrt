@@ -1,0 +1,95 @@
+# MR1500X / MR60Xv2 — system config.
+#
+# WHY THIS FILE IS HERE
+# The OpenWrt rootfs we repackage carries an older project overlay that ships
+# this file with a syntax error: the timeserver's
+# "enabled" line is missing the `option` keyword. uci refuses to parse the whole
+# file, so EVERY uci write fails:
+#     uci: Parse error (invalid command) at line 6, byte 1
+# which means no LuCI setting can ever be saved. That is the same overlay that
+# once replaced /etc/preinit; treat anything it provides with suspicion.
+#
+# Only the syntax is fixed here — the timeserver is left disabled, which is what
+# the original line was evidently trying to express.
+
+config system
+	option hostname	'OpenWrt-MR1500X'
+	option timezone	'UTC'
+
+config timeserver 'ntp'
+	option enabled	'0'
+	list server	'0.openwrt.pool.ntp.org'
+
+# ---------------------------------------------------------------------------
+# LEDs — applied by /etc/init.d/led (S96). Editable in LuCI under
+# System -> LEDs & Buttons. The stock LuCI LED page cannot work here: this
+# kernel has no LED class (CONFIG_NEW_LEDS is not set), so these sections are
+# read by our own init, not by the kernel. The pin map and the reasoning behind
+# it are in the header comment of /etc/init.d/led.
+#
+#   option interface  status | wps | lan1 | lan2 | wan
+#   option trigger    auto | on | off | timer
+#                     auto  = do not touch it (leave kernel/ASIC behaviour)
+#                     timer = blink, using delayon/delayoff in MILLISECONDS
+#   option color      green | orange      (interface 'status' only — it is one
+#                                          dual-color LED on two GPIOs)
+#
+# The port LEDs (lan1/lan2/wan) are switch-ASIC forced modes: setting them to
+# on or off REPLACES link/activity indication until the next reboot, and there
+# is no proc value that restores it. That is why they ship as 'auto'.
+# ---------------------------------------------------------------------------
+
+config led
+	option name	'Status'
+	option interface	'status'
+	option color	'green'
+	option trigger	'on'
+
+# WPS LED (gpio57): the BSP defines the pin and /etc/init.d/led supports it,
+# but THIS board does not fit the LED, so no section ships. Variants in this
+# family may have it — if yours does, uncomment this and it works. Polarity is
+# unverified, so check whether on/off come out swapped.
+#config led
+#	option name	'WPS'
+#	option interface	'wps'
+#	option trigger	'on'
+
+config led
+	option name	'LAN1'
+	option interface	'lan1'
+	option trigger	'auto'
+
+config led
+	option name	'LAN2'
+	option interface	'lan2'
+	option trigger	'auto'
+
+config led
+	option name	'WAN'
+	option interface	'wan'
+	option trigger	'auto'
+
+# ---------------------------------------------------------------------------
+# Button — one physical button (WPS and Reset share it), handled by
+# /etc/rc.button/reset. `action` is an EFFECT NAME, not a shell command:
+# this file is web-editable, so free-form commands are not accepted.
+#
+#   option button  reset
+#   option min/max hold time window in SECONDS (first match wins)
+#   option action  none | reboot | factory_reset
+#
+# Defaults are deliberately conservative: a short tap does nothing, a long
+# hold reboots, and NOTHING is wired to factory_reset out of the box.
+# ---------------------------------------------------------------------------
+
+config button
+	option button	'reset'
+	option min	'0'
+	option max	'4'
+	option action	'none'
+
+config button
+	option button	'reset'
+	option min	'5'
+	option max	'30'
+	option action	'reboot'

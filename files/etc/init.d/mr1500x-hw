@@ -1,0 +1,46 @@
+#!/bin/sh /etc/rc.common
+# MR1500X / MR60Xv2 — board identity + button driver.
+#
+# Two small things that have to happen early and have nowhere else to live.
+#
+# 1. /tmp/sysinfo — OpenWrt normally gets this from target board.d support,
+#    which this port has none of. LuCI's status page shows "Unknown" without
+#    it, and `sysupgrade` uses board_name for its compatibility check. /tmp is
+#    tmpfs, so this must run every boot.
+#
+# 2. gpio-button-hotplug — the physical button is a polled GPIO
+#    (gpio-keys-polled.0, registered by the vendor kernel) and this kernel has
+#    NO input subsystem (`# CONFIG_INPUT is not set`), so the only way to see
+#    presses is the vendor's gpio-button-hotplug.ko, which turns them into
+#    hotplug uevents. Taken from the stock rootfs
+#    (lib/modules/iplatform/gpio-button-hotplug.ko); its vermagic is
+#    "4.4.176 mod_unload MIPS32_R2 32BIT" = exactly this kernel.
+#    NOTE the OpenWrt package of the same name that ships in the userspace we
+#    repackage is built for 5.4.238 and can never load — ours goes in
+#    /lib/modules/4.4.176/ and wins because kmodloader/insmod only look at
+#    /lib/modules/$(uname -r).
+#
+# Failure here is not fatal: without the module the button is simply inert.
+
+START=12
+
+BTN_KO=/lib/modules/4.4.176/gpio-button-hotplug.ko
+
+start() {
+	mkdir -p /tmp/sysinfo
+	echo "Mercusys MR1500X" >/tmp/sysinfo/model
+	echo "mercusys,mr1500x" >/tmp/sysinfo/board_name
+
+	if ! grep -q '^gpio_button_hotplug ' /proc/modules 2>/dev/null; then
+		if [ -e "$BTN_KO" ]; then
+			insmod "$BTN_KO" 2>/dev/null ||
+				logger -t mr1500x-hw "insmod $BTN_KO failed — button inert"
+		else
+			logger -t mr1500x-hw "$BTN_KO missing — button inert"
+		fi
+	fi
+}
+
+stop() {
+	return 0
+}

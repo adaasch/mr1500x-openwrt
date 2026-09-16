@@ -1,0 +1,192 @@
+#!/bin/sh /etc/rc.common
+# MR1500X / MR60Xv2 — LED control on the vendor kernel.
+#
+# WHY THIS REPLACES THE STOCK OpenWrt `led` INIT
+#   The stock init only speaks /sys/class/leds. That interface CANNOT EXIST on
+#   this box: the vendor kernel is built with `# CONFIG_NEW_LEDS is not set`
+#   (gpl .../build/kernel.config), so there is no LED class at all and no
+#   module can add one — led_classdev_register() is not even compiled in.
+#   LuCI's stock "LED Configuration" page hides itself accordingly (its menu
+#   entry depends on fs:/sys/class/leds being a directory), so this device gets
+#   its own page instead: System -> LEDs & Buttons (view/mr1500x/hardware.js).
+#
+# HOW THE HARDWARE IS ACTUALLY DRIVEN (all verified against the GPL source,
+# board block CONFIG_RTL_8197F_VG_GPIO_V672 — the one this product enables):
+#
+#   Status LED   one DUAL-COLOR LED on two pins, green=gpio19 (C3),
+#                orange=gpio54 (G6). Exactly one pin may be high:
+#                green = 19:1/54:0, orange = 19:0/54:1, off = both 0.
+#                Driving one pin while the other is high does nothing visible,
+#                which is why naive single-pin toggles "don't work".
+#                Both pins are ALREADY exported by the kernel: rtl_gpio.c's
+#                rtl819x_led_probe() requests them with GPIOF_EXPORT_DIR_FIXED
+#                (green OUT_INIT_HIGH = lit at boot, orange OUT_INIT_LOW).
+#                "DIR_FIXED" means `direction` is read-only — never write it.
+#   LAN1/2, WAN  driven by the RTL8367R switch ASIC via
+#                /proc/rtl865x/{lan1,lan2,wan}_led_status (rtknet rtl_nic.c).
+#
+#   WPS LED      gpio57 (H1). SUPPORTED BUT NOT CONFIGURED BY DEFAULT — the
+#                board this was developed on does NOT populate this LED
+#                (confirmed on the device), though the BSP defines the pin
+#                (BSP_WPS_LED_PIN = BSP_RESET_LED_PIN = H1) and other variants
+#                in this family may fit it. So the code stays and no uci
+#                section ships: add one with `option interface 'wps'` and it
+#                works. Unlike 19/54 nothing claims this pin, so we export it
+#                ourselves. Polarity is UNVERIFIED (never seen lit) — if it
+#                comes out inverted, swap the two values in led_apply().
+#
+# *** THE PORT LEDs ARE A ONE-WAY DOOR — THIS IS WHY 'auto' IS THE DEFAULT ***
+#   Those procs accept ONLY "1" (LED_FORCE_ON) and "0" (LED_FORCE_OFF); every
+#   other write returns -EFAULT. The underlying API has a LED_FORCE_NORMAL mode
+#   that restores the ASIC's own link/activity behaviour, but the proc handler
+#   does not expose it. So once you force a port LED, link/act indication is
+#   gone until the next reboot. Leave them on 'auto' unless you mean it.
+#   (Reading them back is useless too: *_led_status_read prints the RETURN CODE
+#   of rtk_led_modeForce_get, not the mode — a vendor bug. Always 0.)
+#
+# HAZARD: do not "extend" this script to other pins by guesswork. gpio29 (D5)
+# and gpio31 (D7) are the switch MDC/MDIO lines; touching them kills the switch
+# and needs a power cycle. See LEDS_BUTTONS.md.
+#
+# Config: uci system.@led[] — see /etc/config/system for the schema.
+
+START=96
+
+GPIO_GREEN=19
+GPIO_ORANGE=54
+GPIO_WPS=57
+GPIO=/sys/class/gpio
+PIDDIR=/var/run
+
+# Blink periods below this fork usleep hard enough to matter on a 4.4-era MIPS
+# core. 20 blinks/s is already past what an eye resolves.
+MIN_DELAY_MS=50
+
+led_log() { logger -t led "$@"; }
+
+gpio_set() {	# $1=pin $2=0|1
+	if ! echo "$2" >"$GPIO/gpio$1/value" 2>/dev/null; then
+		led_log "gpio$1: cannot write '$2' (exported? $GPIO/gpio$1)"
+		return 1
+	fi
+}
+
+# gpio57 is unclaimed by any driver, so unlike 19/54 we own the export. Only
+# reached if someone configures a 'wps' section — see the header.
+gpio_claim_wps() {
+	[ -e "$GPIO/gpio$GPIO_WPS/value" ] && return 0
+	echo "$GPIO_WPS" >"$GPIO/export" 2>/dev/null || {
+		led_log "wps: export of gpio$GPIO_WPS failed"
+		return 1
+	}
+	echo out >"$GPIO/gpio$GPIO_WPS/direction" 2>/dev/null
+	[ -e "$GPIO/gpio$GPIO_WPS/value" ]
+}
+
+status_set() {	# $1=green|orange|off  — exactly one pin high, never both
+	case "$1" in
+	green)	gpio_set $GPIO_GREEN 1; gpio_set $GPIO_ORANGE 0 ;;
+	orange)	gpio_set $GPIO_GREEN 0; gpio_set $GPIO_ORANGE 1 ;;
+	*)	gpio_set $GPIO_GREEN 0; gpio_set $GPIO_ORANGE 0 ;;
+	esac
+}
+
+led_apply() {	# $1=interface $2=1|0 $3=color (status only)
+	case "$1" in
+	status)
+		[ "$2" = 1 ] && status_set "$3" || status_set off
+		;;
+	wps)
+		gpio_claim_wps && gpio_set $GPIO_WPS "$2"
+		;;
+	lan1|lan2|wan)
+		[ -e "/proc/rtl865x/${1}_led_status" ] || {
+			led_log "$1: /proc/rtl865x/${1}_led_status missing"
+			return 1
+		}
+		echo "$2" >"/proc/rtl865x/${1}_led_status" 2>/dev/null ||
+			led_log "$1: forcing LED $2 failed"
+		;;
+	*)
+		led_log "unknown interface '$1' (want: status|wps|lan1|lan2|wan)"
+		return 1
+		;;
+	esac
+}
+
+blink_stop() {	# $1=interface
+	local f="$PIDDIR/led-$1.pid" pid
+	[ -f "$f" ] || return 0
+	pid="$(cat "$f" 2>/dev/null)"
+	[ -n "$pid" ] && kill "$pid" 2>/dev/null
+	rm -f "$f"
+}
+
+blink_start() {	# $1=interface $2=on_ms $3=off_ms $4=color
+	local on="$2" off="$3"
+	[ "$on"  -ge "$MIN_DELAY_MS" ] 2>/dev/null || on=$MIN_DELAY_MS
+	[ "$off" -ge "$MIN_DELAY_MS" ] 2>/dev/null || off=$MIN_DELAY_MS
+	blink_stop "$1"
+	# usleep takes MICROseconds. Passing milliseconds straight through is the
+	# classic bug here: it blinks ~1000x too fast (invisible) and spins the CPU.
+	#
+	# The redirections are not cosmetic: this outlives the shell that starts it,
+	# and an inherited stdout keeps the caller's channel open. Start it from the
+	# :23 debug shell without them and the session hangs with no output.
+	# Diagnostics go to syslog via led_log, never to stdout.
+	(
+		while :; do
+			led_apply "$1" 1 "$4"; usleep $((on * 1000))
+			led_apply "$1" 0 "$4"; usleep $((off * 1000))
+		done
+	) </dev/null >/dev/null 2>&1 &
+	echo $! >"$PIDDIR/led-$1.pid"
+}
+
+load_led() {
+	local interface trigger color delayon delayoff sysfs default
+
+	config_get interface "$1" interface
+	config_get trigger   "$1" trigger  "auto"
+	config_get color     "$1" color    "green"
+	config_get delayon   "$1" delayon  "500"
+	config_get delayoff  "$1" delayoff "500"
+
+	# No `interface` => a stock-style /sys/class/leds section. Dead on this
+	# kernel, but honoured so the file stays portable if that ever changes.
+	if [ -z "$interface" ]; then
+		config_get sysfs "$1" sysfs
+		config_get_bool default "$1" default "1"
+		[ -n "$sysfs" ] && [ -e "/sys/class/leds/$sysfs/brightness" ] && {
+			echo "$trigger" >"/sys/class/leds/$sysfs/trigger" 2>/dev/null
+			[ "$default" = 0 ] &&
+				echo 0 >"/sys/class/leds/$sysfs/brightness" 2>/dev/null
+		}
+		return
+	fi
+
+	blink_stop "$interface"
+
+	case "$trigger" in
+	auto)	;;	# hands off: leave whatever the kernel/ASIC is doing
+	on)	led_apply "$interface" 1 "$color" ;;
+	off)	led_apply "$interface" 0 "$color" ;;
+	timer)	blink_start "$interface" "$delayon" "$delayoff" "$color" ;;
+	*)	led_log "$interface: unknown trigger '$trigger' (want: auto|on|off|timer)" ;;
+	esac
+}
+
+start() {
+	config_load system
+	config_foreach load_led led
+}
+
+stop() {
+	local f
+	for f in "$PIDDIR"/led-*.pid; do
+		[ -f "$f" ] || continue
+		kill "$(cat "$f" 2>/dev/null)" 2>/dev/null
+		rm -f "$f"
+	done
+	return 0
+}

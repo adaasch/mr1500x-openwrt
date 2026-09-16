@@ -1,0 +1,96 @@
+From: MR1500X port
+Subject: nl80211: implement the sta_assoc driver op (association-response reply)
+
+The Realtek rtl8192cd driver in this router's vendor kernel (4.4.176) sets
+WIPHY_FLAG_HAVE_AP_SME, so hostapd takes the device-AP-SME path and expects the
+device to answer association requests itself. But the driver is built with
+REPLY_ASSOC_BY_HAPD (8192cd_cfg.h:5107), which makes it deliberately NOT send
+the association response:
+
+    #if defined(RTK_NL80211) && defined(REPLY_ASSOC_BY_HAPD)
+        { /* 2021-03-15 assoc related handling offload to hapd */ }
+    #else
+        issue_asocrsp(priv, status, pstat, WIFI_ASSOCRSP, ...);
+    #endif
+
+hostapd_notif_assoc() does call hostapd_sta_assoc() (we build with
+CONFIG_IEEE80211R, so the call site is compiled in), but upstream
+driver_nl80211 has no .sta_assoc op, so hostapd_sta_assoc() returns 0 without
+doing anything. Result: the driver accepts the association and notifies
+hostapd, hostapd creates the STA, and *nobody ever puts an association
+response on the air*. Clients associate-timeout forever; with WPA2 the
+symptom looks like a dead 4-way handshake, because hostapd sends M1 to a
+station that never actually associated.
+
+The vendor's own hostapd (GPL drop, packages/hostapd/src) carries exactly this
+op; the driver picks the frame up in realtek_mgmt_tx() and turns it back into
+issue_asocrsp(). This is that function, with two deviations from the vendor's
+copy: our send_mlme takes an extra trailing no_encrypt argument, and the log
+line is MSG_INFO rather than MSG_DEBUG. The latter is deliberate — OpenWrt
+builds wpad with MSG_DEBUG compiled out, so an MSG_INFO line is both the only
+on-device confirmation that this patch is live ("nl80211: sta_assoc ..." in
+logread on every association) and a string the image build can assert on.
+
+--- a/src/drivers/driver_nl80211.c
++++ b/src/drivers/driver_nl80211.c
+@@ -11587,6 +11587,52 @@
+ #endif /* CONFIG_DPP */
+ 
+ 
++int nl80211_sta_assoc(void *priv, const u8 *own_addr, const u8 *addr,
++		      int reassoc, u16 status, const u8 *ie, size_t len)
++{
++	struct i802_bss *bss = priv;
++	struct ieee80211_mgmt *mgmt;
++	size_t rlen;
++	u8 *buf;
++
++	wpa_printf(MSG_INFO,
++		   "nl80211: sta_assoc " MACSTR " reassoc=%d status=%d"
++		   " (rtl8192cd assoc-resp offload)",
++		   MAC2STR(addr), reassoc, status);
++
++	rlen = IEEE80211_HDRLEN + sizeof(mgmt->u.assoc_resp) + len;
++
++	buf = os_zalloc(rlen);
++	if (buf == NULL)
++		return 0;
++
++	mgmt = (struct ieee80211_mgmt *) buf;
++	mgmt->frame_control = (reassoc == 1) ?
++		IEEE80211_FC(WLAN_FC_TYPE_MGMT, WLAN_FC_STYPE_REASSOC_RESP) :
++		IEEE80211_FC(WLAN_FC_TYPE_MGMT, WLAN_FC_STYPE_ASSOC_RESP);
++
++	os_memcpy(mgmt->da, addr, ETH_ALEN);
++	os_memcpy(mgmt->sa, own_addr, ETH_ALEN);
++	os_memcpy(mgmt->bssid, own_addr, ETH_ALEN);
++
++	mgmt->u.assoc_resp.status_code = host_to_le16(status);
++
++	if (ie && len)
++		os_memcpy(mgmt->u.assoc_resp.variable, ie, len);
++
++	/*
++	 * The AID and capability fields are deliberately left zero: the Realtek
++	 * driver rebuilds the response from its own per-STA state and takes
++	 * only the status code and the IEs from this frame.
++	 */
++	wpa_driver_nl80211_send_mlme(bss, buf, rlen, 0, 0, 0, 0, 0, NULL, 0, 0);
++
++	os_free(buf);
++
++	return 0;
++}
++
++
+ const struct wpa_driver_ops wpa_driver_nl80211_ops = {
+ 	.name = "nl80211",
+ 	.desc = "Linux nl80211/cfg80211",
+@@ -11617,6 +11663,7 @@
+ 	.send_mlme = driver_nl80211_send_mlme,
+ 	.get_hw_feature_data = nl80211_get_hw_feature_data,
+ 	.sta_add = wpa_driver_nl80211_sta_add,
++	.sta_assoc = nl80211_sta_assoc,
+ 	.sta_remove = driver_nl80211_sta_remove,
+ 	.tx_control_port = nl80211_tx_control_port,
+ 	.hapd_send_eapol = wpa_driver_nl80211_hapd_send_eapol,

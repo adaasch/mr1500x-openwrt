@@ -1,0 +1,68 @@
+#!/bin/sh /etc/rc.common
+# MR1500X vendor-kernel VLAN bring-up.
+#
+# The vendor kernel needs its 802.1q layer switched on and the CPU-trunk VLAN
+# netdevs created before netifd configures br-lan. The stock firmware does this
+# via /sbin/switch_init + /etc/init.d/boot; OpenWrt has no equivalent, so we
+# reproduce the minimal router-mode subset here.
+#
+# NOTE: `vconfig` is NOT shipped in this OpenWrt rootfs (not a binary and not a
+# busybox applet) — we use `ip link add ... type vlan`, which sbin/ip provides.
+# The kernel already reports RAW_PLUS_VID_NO_PAD naming, and `ip` names the
+# device explicitly anyway, so no set_name_type is needed.
+#
+# The per-port VLAN membership is set up by the vendor ethernet driver in-kernel
+# (stock lib/switch/core.sh explicitly skips it), so we deliberately do NOT write
+# /proc/net/vlan/vlanGroup or pvid — those paths are AP-mode/IPTV only and would
+# override the driver defaults in router mode.
+#
+# START must be < network (20) so the netdevs exist when netifd starts.
+START=15
+
+boot() { start "$@"; }
+
+add_vlan() {	# $1=parent $2=vid  -> creates "<parent>.<vid>"
+	[ -d "/sys/class/net/$1" ] || return 0
+	[ -d "/sys/class/net/$1.$2" ] && return 0
+	ip link add link "$1" name "$1.$2" type vlan id "$2" 2>/dev/null
+}
+
+start() {
+	# enable the vendor vlan layer (fmt: "<enable> <hw_support>")
+	[ -w /proc/net/vlan/vlanEnable ] && echo "1 1" > /proc/net/vlan/vlanEnable
+
+	# Bridge multicast snooping, the vendor way (these are rtl865x procfs
+	# entries, not the standard bridge sysfs ones). Not required for
+	# connectivity — without them multicast is simply flooded — but every
+	# validated image up to v18 had them on, because an old project overlay
+	# set them on first boot from a uci-default. That overlay is not part of
+	# the published tree, so the
+	# writes live here instead: the shipped image should behave like the
+	# image that was tested, and a silent multicast behaviour change is a
+	# poor thing to discover on someone else's IPTV stream.
+	for p in br_igmpsnoop br_mldsnoop br_igmpquery br_mldquery; do
+		[ -w "/proc/$p" ] && echo 1 > "/proc/$p"
+	done
+
+	ip link set eth0 up 2>/dev/null
+	ip link set eth1 up 2>/dev/null
+
+	add_vlan eth0 2		# LAN trunk to the RTL8367 LAN ports
+	add_vlan eth1 1		# WAN
+
+	ip link set eth0.2 up 2>/dev/null
+	ip link set eth1.1 up 2>/dev/null
+
+	# *** PHY POWER-UP — the reason candidate #2 had no carrier ***
+	# The vendor kernel holds the RTL8367 switch ports administratively DOWN
+	# until userspace says go; stock does it from /etc/rc.d/S99zphyport ->
+	# link_up_all_ports() in lib/switch/core_phy.sh. Without this write there
+	# is NO ethernet carrier at all and the box is unreachable.
+	# (The stock set_phy_power()/`switch phy_power` path is dead code — no
+	# `switch` binary exists in the vendor rootfs. This single write is the
+	# real mechanism.) Read side is a bitmask, bit N = port N:
+	# LAN = ports 3,4 (mask 24) · WAN = port 2 (mask 4).
+	[ -e /proc/rtl865x/link ] && echo 1 > /proc/rtl865x/link
+
+	return 0
+}

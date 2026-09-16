@@ -1,0 +1,71 @@
+# MR1500X / MR60Xv2 (RTL8197F) — network config matched to the VENDOR kernel.
+#
+# Ground truth captured from the running vendor firmware (2026-09-02):
+#   br-lan  192.168.1.1/24  <- eth0.2 (+ wifi vaps)
+#   br-wan                  <- eth1.1
+#   eth0.3 = VLAN3 (guest/iptv), unused here
+# eth0.2 was verified carrying live traffic (rx 315 / tx 25 = the admin session).
+#
+# The RTL8367 switch VLAN/port mapping is programmed by the vendor ETHERNET
+# DRIVER in-kernel, not by userspace — see the stock lib/switch/core.sh:
+#   setup_vlan() { # ...setupdefaultVlan in raeth.ko, no need to do it in
+#                  # initScript
+#                  return }
+# So there is NO swconfig here (the binary doesn't exist in the vendor rootfs)
+# and no /etc/config/switch: we must NOT drive the switch from userspace. We
+# only need the tagged CPU VLAN netdev eth0.2, bridged and addressed.
+#
+# Syntax note: this OpenWrt (21.02+) uses `config device` / `option device`.
+# The VLAN netdev itself is created by /etc/init.d/vendor-vlan (via `ip link`,
+# because vconfig is NOT shipped in this rootfs) before netifd starts.
+
+config interface 'loopback'
+	option device   'lo'
+	option proto    'static'
+	option ipaddr   '127.0.0.1'
+	option netmask  '255.0.0.0'
+
+# 'auto' is the sentinel /etc/uci-defaults/12_network-generate-ula looks for: it
+# replaces this with a random fd??:????:????::/48 on first boot and commits it,
+# so each unit gets its own ULA. Anything else — including a literal prefix — is
+# left alone, which is how this line used to read 'fd00:1500:0x00::/48'. That
+# was both a placeholder shipped to every unit AND not a valid IPv6 prefix ('x'
+# is not a hex digit), so netifd silently assigned no ULA address at all.
+config globals 'globals'
+	option ula_prefix 'auto'
+
+# LAN bridge over the tagged CPU trunk VLAN 2 (the RTL8367 LAN ports)
+config device
+	option name     'br-lan'
+	option type     'bridge'
+	list   ports    'eth0.2'
+
+config interface 'lan'
+	option device   'br-lan'
+	option proto    'static'
+	option ipaddr   '192.168.1.1'
+	option netmask  '255.255.255.0'
+	option ip6assign '60'
+
+# WAN = tagged VLAN 1 on eth1, in the 'wan' firewall zone. Enabled: this is a
+# router, and one that does not route out of the box is a bug. (The bench tree
+# ships it disabled instead, so that a bad upstream can never take the box off
+# the LAN while it is being worked on — that reason does not apply to someone
+# flashing their own router.)
+config interface 'wan'
+	option device   'eth1.1'
+	option proto    'dhcp'
+
+# Upstream Wi-Fi client uplink. `auto 0` on purpose: netifd must not try to
+# DHCP on this before /etc/init.d/mr1500x-wwan has associated the radio, and on
+# a unit where the uplink is not configured it must stay down entirely.
+# See /etc/config/mr1500x-wifi (section 'wwan').
+#
+# `option device` here is documentation, not the binding: netifd ignores netdevs
+# that have a phy80211 sysfs link, so it never resolves this name by itself and
+# reports NO_DEVICE. /etc/init.d/mr1500x-wwan attaches the vdev explicitly with
+# `ubus call network.interface.wwan add_device` once it has associated.
+config interface 'wwan'
+	option device   'wlan1-vxd'
+	option proto    'dhcp'
+	option auto     '0'
