@@ -28,6 +28,15 @@
 #   are an older revision that would be a regulatory regression. They are
 #   extracted from the official Mercusys firmware YOU download — see --firmware.
 #
+# DANGER — NO SUPPORT, NO WARRANTY
+#   Hobby project, published as-is. If the image this script bricks
+#   your device, the author cannot help you — and provides no support of any
+#   kind, for this script or for the image it produces. Flash at your own
+#   risk; the recovery paths are described in README.md (§5, §7). Pull
+#   requests are read only when they carry evidence of testing on hardware
+#   (device and revision, the image flashed, measured behaviour) — see
+#   README.md, "DANGER".
+#
 # USAGE
 #   ./build_image.sh
 #
@@ -132,7 +141,7 @@ while [ $# -gt 0 ]; do
         --keep)     KEEP=1; shift ;;
         --selftest) SELFTEST=1; shift ;;
         --check-deps) DEPS_ONLY=1; shift ;;
-        -h|--help)  sed -n '2,50p' "$0"; exit 0 ;;
+        -h|--help)  sed -n '2,68p' "$0"; exit 0 ;;
         *)          die "unknown argument: $1" ;;
     esac
 done

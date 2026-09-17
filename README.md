@@ -20,6 +20,29 @@ image comes from this repository.
 
 ---
 
+## DANGER — no support, read this before you flash
+
+This is a hobby port, published as-is, tested by one person on one device.
+
+- **If flashing bricks your device, nobody can help you.** This board has no
+  serial console. The recovery paths (§5, §7) — the bootloader's TFTP rescue
+  and a SPI programmer with a clip — all want the device physically on *your*
+  desk. Flash nothing you cannot afford to lose.
+- **There is no support of any kind.** Not for configuration, not for
+  troubleshooting, not for porting to other models or hardware revisions, not
+  on any timetable. This README is the whole of the documentation; beyond it,
+  you are on your own.
+- **Pull requests are read only if they come with evidence that they were
+  tested.** Say which device and hardware revision you ran it on, which image
+  you flashed, and show what changed in behaviour — measured, not inferred.
+  Changes nobody has run on hardware cannot be evaluated here and will not be
+  merged.
+
+The GPLv2 text in LICENSE is the legal form of the same statement: this
+program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR
+A PARTICULAR PURPOSE.
+
 ## 1. What this is
 
 | | |
@@ -268,7 +291,8 @@ container arithmetic) in a couple of seconds without building anything.
 
 The image is pushed to the bootloader's own TFTP recovery ("down mode"). This
 is the same path the vendor's own recovery uses, and it writes only the rootfs
-region.
+region. **If this step goes wrong, nobody can help you** — see *DANGER*
+at the top of this file, and §5 for the recovery that still exists.
 
 1. **Set your PC to a static `192.168.1.x/24`** (not .1) on the LAN port.
 2. **Enter down mode:** power the router off, hold the reset button, power it
