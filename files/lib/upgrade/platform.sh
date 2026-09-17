@@ -54,9 +54,21 @@ FWUPD=/sbin/mr1500x-fwupd
 # place on this board that states what the hardware actually is.
 PRODUCT_OFF=$((0xba0400))
 # The models the vendor's own SupportList (flash 0xfe0900) names for this image.
-# MR1500X is the only one this firmware has been run on; the others are the same
-# board and image according to the vendor, so they warn rather than refuse.
+#
+# These warn rather than refuse, because "same board" here is not an inference:
+# Mercusys publishes the MR1500X v2, MR60X v2 and MR62X v1 firmware as three
+# differently-named zips containing one byte-identical upgrade image
+# (sha256 511897d3…), built in a tree its own binaries call "MR60Xv2". Refusing
+# a board the vendor treats as this board would be theatre.
+#
+# MR1500X v2 is still the only one it has been RUN on, hence the notices below.
 KNOWN_PRODUCTS="MR1500X MR60X MR62X"
+# Hardware revisions covered by that firmware. A board outside this set is a
+# later revision of the same design — today that means the v2.20 refresh, which
+# the vendor serves a separate firmware for, with two of the 39 RF calibration
+# files changed (5 GHz TXPWR_ByRate, ther.conf). Still the same kernel, vermagic
+# and flash layout, so this is a louder warning and not a refusal.
+KNOWN_HW_VERS="1.0.0 2.0.0 3.0.0"
 
 # Is the hardware underneath us the hardware this image is for?
 #
@@ -67,7 +79,7 @@ KNOWN_PRODUCTS="MR1500X MR60X MR62X"
 # back RAM rather than flash — so this is the one place a positive
 # identification is possible, and it costs one dd.
 platform_identify_device() {
-	local mtdnum info name
+	local mtdnum info name ver known_ver
 
 	mtdnum="$(find_mtd_index rootfs)"
 	[ -n "$mtdnum" ] || {
@@ -100,8 +112,31 @@ platform_identify_device() {
 			;;
 	esac
 	[ "$name" = MR1500X ] || echo "mr1500x: board reports $name; this image" \
-		"has only been tested on MR1500X v2. Same hardware per the vendor's" \
-		"SupportList, but you are the first." >&2
+		"has only been run on MR1500X v2. The vendor ships one byte-identical" \
+		"firmware for both, so this should be the same hardware — but you are" \
+		"the first. Keep your stock firmware zip." >&2
+
+	# Same record, one field further down: which revision of that board.
+	# The empty case is spelled out rather than folded into the glob: an
+	# unset $ver inside the pattern would be matched, not compared.
+	ver=$(echo "$info" | sed -n 's/^product_ver:\([0-9.]*\).*/\1/p' | head -1)
+	known_ver=
+	if [ -n "$ver" ]; then
+		case " $KNOWN_HW_VERS " in
+			*" $ver "*) known_ver=y ;;
+		esac
+	fi
+	case "$known_ver" in
+		y) ;;
+		*)
+			echo "mr1500x: board reports hardware revision ${ver:-<none>}," \
+			     "which is not one this image has run on ($KNOWN_HW_VERS)." \
+			     "Later revisions of this design exist — the v2.20 refresh" \
+			     "— and the vendor gives them their own firmware, with" \
+			     "different 5 GHz power tables. Continuing; TFTP rescue is" \
+			     "unaffected, but be ready to roll back." >&2
+			;;
+	esac
 	return 0
 }
 

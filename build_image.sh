@@ -3,10 +3,14 @@
 # build_image.sh — build mr1500x-root-r6cr.bin from source.
 #
 # WHAT THIS PRODUCES
-#   A rootfs-only image for the Mercusys MR1500X v2 (and its MR60X v2/v3 /
-#   MR62X siblings): OpenWrt 21.02.7 userspace running on the device's OWN
-#   vendor kernel (Linux 4.4.176), wrapped in the `r6cr` container the vendor
-#   bootloader burns to flash 0x400000.
+#   A rootfs-only image for the Mercusys MR1500X v2: OpenWrt 21.02.7 userspace
+#   running on the device's OWN vendor kernel (Linux 4.4.176), wrapped in the
+#   `r6cr` container the vendor bootloader burns to flash 0x400000.
+#
+#   The MR60X v2 and MR62X v1 are the same board. Not "compatible" — the same:
+#   Mercusys ships one firmware file under all three names, byte for byte
+#   (sha256 511897d3…, see FW_BIN_SHA below). This image should run on them
+#   and NOBODY HAS TRIED. See "Which devices" in README.md before you do.
 #
 #   It writes ONLY the rootfs region. The bootloader, the stock kernel and the
 #   factory tail at 0xfa0000 (MAC, WPS pin, radio calibration — none of it
@@ -83,6 +87,28 @@ GPL_SHA=97e707d33f1cab78e8dd4056f8be650bfdb7471262bc33549902afb10b235b04
 # version is pinned and --firmware takes a local file if you want another.
 FW_URL=https://static.mercusys.com/software/MR1500X_V2_1.1.3_Build_2025061020250902063658.zip
 FW_SHA=b7b2fe9dc738929313f05bb41e2e347557f168d44833e54a193770e195a64d7c
+# ...and the sha256 of the upgrade .bin INSIDE that zip. It is pinned
+# separately because it is the more useful of the two: Mercusys ships the SAME
+# .bin under three product names, in three zips that differ only in their
+# filenames and therefore have three different zip checksums.
+#
+#   MR1500X_V2_1.1.3_Build_2025061020250902063658.zip
+#   MR60X_V2_1.1.3_Build_2025061020250902061224.zip
+#   MR62X_V1_1.1.3_Build_2025061020250908071011.zip
+#
+# all unpack to 14,178,721 bytes with this hash. So an MR60X v2 or MR62X v1
+# owner who downloads the firmware for the box in front of them gets the
+# byte-identical, tested payload, and `--firmware` says so instead of falling
+# back to "pin not enforced". See "Which devices" in README.md.
+FW_BIN_SHA=511897d33b32bb766ae2778b38770c9ea65fa2f51ec140216ba1cba5951939d4
+# The models the vendor's own SupportList names for this image family. Used
+# only to refuse a firmware belonging to some other Mercusys board, whose RF
+# tables would be for a radio this one does not have.
+FAMILY_PRODUCTS="MR1500X MR60X MR62X"
+# The hardware revisions that tested payload is for. A firmware whose
+# SupportList names none of these is a different board revision (the v2.20
+# refresh is the one that exists today) — buildable, but nobody has run it.
+FAMILY_HW_VERS="1.0.0 2.0.0 3.0.0"
 # The vendor toolchain inside it, and the kernel tree it must build.
 MSDK_TAR=sdk/toolchain/msdk-6.4.1-mips-EL-4.4-u0.9.33-m32ut-190619.tar.bz2
 KERNEL_SRC=sdk/openwrt-21.02/target/linux
@@ -320,9 +346,87 @@ case "$FIRMWARE" in
         step "firmware: unpacked $(basename "$FIRMWARE")"
         ;;
 esac
+# "Official Mercusys firmware" is not one file format. The MR80X, for one,
+# ships a "fw-type:Cloud" container with no fwup-ptn table at all — a
+# perfectly official image that this parser cannot read and should not
+# claim is fake. Say what was actually wrong.
 python3 "$SELF/tools/extract_stock_rootfs.py" list "$FIRMWARE" >/dev/null \
-    || die "that firmware file is not an official Mercusys upgrade image"
+    || die "that file is not in the upgrade-image format this board uses
+   (no fwup-ptn partition table at 0x1014). Other Mercusys models ship
+   other container formats; this needs the firmware for THIS board."
 step "firmware container parses"
+
+# --- is this firmware for THIS family of boards? -------------------------
+#
+# Everything downstream trusts this file to supply RF tables for the radio
+# that is actually soldered to the board. The existing check is that
+# etc/conf/rtl8832bre/RFE50 exists in its rootfs (step 8), which catches a
+# completely unrelated firmware but not a near miss — another Realtek
+# Mercusys model with the same 5 GHz part and a different antenna design
+# would sail through it and produce an image with the wrong power tables.
+#
+# The firmware states its own answer. Every Mercusys upgrade image carries a
+# support-list section: the set of product names and hardware revisions the
+# vendor will let this file be flashed onto. Reading it is exact, costs
+# nothing, and needs no table of models maintained here beyond the family
+# name itself.
+python3 "$SELF/tools/extract_stock_rootfs.py" section "$FIRMWARE" support-list \
+        "$WORK/fw-support-list" >/dev/null \
+    || die "firmware has no support-list section — not an official image"
+FW_SUPPORT=$(tr -d '\000' < "$WORK/fw-support-list")
+# `|| true` because a grep that matches nothing exits 1, and under
+# `set -e` that aborts the build inside the assignment — before the check
+# below can say anything useful about why. Same trap as the `grep -q`
+# pipelines further down; see the note on the VHT assertion.
+FW_PRODUCTS=$(printf '%s' "$FW_SUPPORT" \
+    | grep -o 'product_name:[A-Za-z0-9_-]*' | cut -d: -f2 | sort -u || true)
+FW_HW_VERS=$(printf '%s' "$FW_SUPPORT" \
+    | grep -o 'product_ver:[0-9.]*' | cut -d: -f2 | sort -u || true)
+[ -n "$FW_PRODUCTS" ] || die \
+"firmware support-list section names no products at all.
+
+   The container parsed, so this is a Mercusys image, but its support-list
+   is empty or in a layout this does not understand. Refusing rather than
+   guessing which board its RF tables belong to."
+
+FW_KNOWN=""; FW_FOREIGN=""
+for p in $FW_PRODUCTS; do
+    case " $FAMILY_PRODUCTS " in
+        *" $p "*) FW_KNOWN="$FW_KNOWN $p" ;;
+        *)        FW_FOREIGN="$FW_FOREIGN $p" ;;
+    esac
+done
+[ -n "$FW_KNOWN" ] || die \
+"this firmware is not for this family of boards.
+
+   Its support-list names:$FW_FOREIGN
+   This image is for:      $FAMILY_PRODUCTS
+
+   Its RF tables are calibrated for that board's radio and antennas, not
+   this one, so building with it would produce an image that transmits
+   wrong. If your device IS one of the models above, download ITS firmware
+   from https://www.mercusys.com/en/download/<model>/<ver>/ . If it is not,
+   this kit is for a different router."
+step "firmware is for$FW_KNOWN (hardware $(echo $FW_HW_VERS))"
+[ -z "$FW_FOREIGN" ] || step "note: its support-list also names$FW_FOREIGN"
+
+# Tested-payload check. Deliberately a note, not a gate: --firmware exists so
+# a newer build's tables CAN be used, and a sibling's download is the same
+# bytes. What is worth saying out loud is which of those three cases this is.
+FW_BIN_SEEN=$(sha256sum "$FIRMWARE" | cut -d' ' -f1)
+if [ "$FW_BIN_SEEN" = "$FW_BIN_SHA" ]; then
+    step "firmware payload is the tested 1.1.3 build, byte for byte"
+else
+    FW_HW_TESTED=""
+    for v in $FW_HW_VERS; do
+        case " $FAMILY_HW_VERS " in *" $v "*) FW_HW_TESTED=y ;; esac
+    done
+    step "firmware payload differs from the tested 1.1.3 build" \
+         "(sha256 $FW_BIN_SEEN)"
+    [ -n "$FW_HW_TESTED" ] || step \
+        "WARNING: its support-list names hardware revision(s)" \
+        "$(echo $FW_HW_VERS), none of which this image has ever run on"
+fi
 
 say "2. OpenWrt $OW_TAG source"
 if [ ! -d "$OW/.git" ]; then

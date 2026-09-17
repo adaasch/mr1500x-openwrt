@@ -1,10 +1,14 @@
-# OpenWrt userspace on the Mercusys MR1500X v2
+# OpenWrt userspace on the Mercusys MR1500X v2 (and MR60X v2 / MR62X v1)
 
 This turns a Mercusys MR1500X v2 into an OpenWrt 21.02.7 router **without
 replacing its kernel**. The device keeps its vendor Linux 4.4.176 — which is
 what drives its two Realtek radios, its switch and its hardware NAT — and only
 the root filesystem is replaced. You get LuCI, uci, opkg, dropbear, fw3, a
 persistent overlay and working 2.4 + 5 GHz Wi-Fi.
+
+The MR60X v2 and MR62X v1 are the same board — Mercusys ships one firmware file
+under all three names — so this should run on them too, **but it has only been
+tested on an MR1500X v2**. Read [Which devices](#which-devices) first.
 
 It is built entirely from public sources by `build_image.sh`. No binary in the
 image comes from this repository.
@@ -20,7 +24,7 @@ image comes from this repository.
 
 | | |
 |---|---|
-| Device | Mercusys MR1500X v2 (same image family as MR60X v2/v3 and MR62X) |
+| Device | Mercusys MR1500X v2 — see [Which devices](#which-devices) for the siblings |
 | SoC | Realtek RTL8197F(H), MIPS 24Kc |
 | 2.4 GHz | RTL8192FE, in-SoC, driver `rtl8192cd` |
 | 5 GHz | RTL8832BR on PCIe, driver `rtk_wifi6` |
@@ -33,6 +37,85 @@ kernel from `os-image`, the vendor kernel mounts `rootfs` at flash `0x400000`,
 and that rootfs is ours — an OpenWrt 21.02.7 mipsel_24kc musl userspace, plus
 three kernel modules built against the vendor kernel source, plus one patched
 `wpad`. Everything else on the flash is untouched.
+
+### Which devices
+
+**Tested on exactly one model: the MR1500X v2.** Everything below is an
+argument that other models are the same hardware. It is a good argument and it
+is not a test.
+
+Mercusys ships **one firmware file under three product names**. The downloads
+for the MR1500X v2, the MR60X v2 and the MR62X v1 are three `.zip`s with three
+different names — and the upgrade image inside each is byte-identical:
+
+| Download | `.bin` inside | sha256 |
+|---|---|---|
+| `MR1500X_V2_1.1.3_Build_2025061020250902063658.zip` | 14,178,721 B | `511897d3…1939d4` |
+| `MR60X_V2_1.1.3_Build_2025061020250902061224.zip` | 14,178,721 B | `511897d3…1939d4` |
+| `MR62X_V1_1.1.3_Build_2025061020250908071011.zip` | 14,178,721 B | `511897d3…1939d4` |
+
+Not "compatible" — identical. The corroborating detail: the vendor's own build
+paths, left in the binaries, all read
+`/var/lib/jenkins/workspace/Mercusys-IPF-Router/MR60Xv2/…` — note *MR60Xv2*,
+in the file sold as MR1500X firmware — and `/etc/easymesh_cfg.json` in that
+same file says `"manufacturer_model": "MR60X V2.0"`. There is no per-model
+branching anywhere in the vendor rootfs; `product-info` is read only to print
+a name (`/sbin/getfirm`). One board, three labels.
+
+That matters here because of what this image actually depends on:
+
+- **the vendor kernel**, which it does not replace — same file, so same kernel;
+- **module loading**, gated only by the vermagic string
+  `4.4.176 mod_unload MIPS32_R2 32BIT` (`CONFIG_MODVERSIONS` is off) — identical;
+- **the flash layout** — the partition table in the firmware is identical;
+- **the RF calibration tables**, which `build_image.sh` extracts from the
+  firmware *you* download — so an MR60X or MR62X owner downloads their own
+  model's firmware and gets the same bytes anyway.
+
+So the honest summary:
+
+| Model | Status |
+|---|---|
+| **MR1500X v2** | **Tested.** This is the bench unit. |
+| MR60X v2 | Untested. Same firmware file, byte for byte. |
+| MR62X v1 | Untested. Same firmware file, byte for byte. |
+| MR60X v3.0.0 | Untested. Named in this firmware's own SupportList (BR region). |
+| MR1500X / MR60X **v2.20** | Untested, and a genuine hardware revision — see below. |
+
+Ignore the version on the box and check what the device reports: hardware
+revision lives in the `product-info` record in flash, and the sysupgrade path
+reads it and tells you (§4, *Later upgrades*). The labels are not reliable —
+Mercusys's own "MR60X V3" download page serves firmware whose SupportList says
+`product_ver:2.20`, while the SupportList in the *v2* firmware names an
+`MR60X 3.0.0`. Those are two different things wearing the same "v3".
+
+**The v2.20 revision is a weaker claim than the others.** Mercusys serves it a
+separate firmware, and while it is clearly the same design — same kernel
+version and build toolchain, same vermagic, same partition table, same single
+RF table set (`rtl8832bre/RFE50`), rootfs trees differing in 3 files out of
+3281 — two of the 39 RF files *do* differ: `rtl8832bre/RFE50/AP_5G/TXPWR_ByRate.txt`
+and `ther.conf`. That is a real change to transmit power and thermal
+behaviour. Build with your own device's firmware and those differences come
+along correctly; but "same design" is not "same board", and nobody has run
+this on one.
+
+Both halves of the kit check this for you. `build_image.sh` reads the
+SupportList out of the firmware you hand it, refuses one belonging to a
+different family outright, and says whether the payload is the tested build.
+`sysupgrade` reads the board's own `product-info` and warns — by name and by
+revision — when it is not the one this image was tested on.
+
+#### If you have one of the untested models
+
+The risk is not bricking. The recovery path does not depend on any of this:
+the bootloader's TFTP rescue is in `fs-uboot`, which this image never writes,
+and §5 has a rollback to stock that works the same way. The realistic failure
+is a radio that does not come up, or comes up wrong.
+
+So: keep the stock firmware `.zip` you downloaded — §5 turns it back into a
+flashable image — read §4 before you start, and please open an issue saying
+what happened either way. The first person to run this on an MR60X or MR62X
+turns a paragraph of reasoning into a fact.
 
 ### What is on the flash, and what this writes
 
@@ -129,8 +212,12 @@ vendor rather than from a stranger:
 - **the GPL drop** — Mercusys MR60X v2 product page → *GPL Code*. It carries the
   kernel source, the kernel config, the `gpio-button-hotplug` source and the
   Realtek MSDK toolchain. Its sha256 is pinned in the script.
-- **the official firmware image** — the MR1500X v2 download page. Only 39 files
-  are taken from it: the 5 GHz RF calibration tables (see §5).
+- **the official firmware image** — the download page for **the model on the
+  label of your device**: `https://www.mercusys.com/en/download/<model>/<ver>/`,
+  e.g. `mr1500x/v2`, `mr60x/v2`, `mr62x/v1`. Only 39 files are taken from it:
+  the 5 GHz RF calibration tables (see §5). For the three models above the
+  `.bin` inside the zip is the same file, so this is a formality — but it is
+  the right formality, and the build reports which case it got.
 
 Everything else is fetched by the script: OpenWrt at a pinned commit
 (`v21.02.7`, `57a6d97…`) and the package feeds at pinned revisions.
@@ -227,7 +314,10 @@ anything, and it also checks the board: the vendor's product-info record at
 flash `0xfa0400` says `vendor_name:Mercusys` and `product_name:MR1500X`, and an
 upgrade refuses to proceed unless it finds a Mercusys record naming a model this
 image is built for (`MR1500X`, or `MR60X`/`MR62X` with a warning — the same
-board and image per the vendor's own SupportList, but untested here).
+board and image per the vendor's own SupportList, but untested here). The same
+record carries `product_ver`, so it also tells you when the board is a hardware
+revision this image has not run on — a warning, not a refusal, and the most
+reliable way to find out which revision you actually have.
 `sysupgrade -F` overrides that, for a unit whose factory data has been damaged.
 It writes only the rootfs region, and leaves your settings alone —
 the overlay is its own partition, so there is no config backup/restore dance.
