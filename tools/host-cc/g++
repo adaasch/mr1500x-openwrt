@@ -1,0 +1,11 @@
+#!/bin/sh
+# Host C++ compiler shim; pins C++17 unless the caller picked a standard.
+# See tools/host-cc/gcc.
+real=${MR1500X_HOST_GXX:-/usr/bin/g++}
+std=-std=gnu++17
+for a in "$@"; do
+    case "$a" in
+        -std=*|--std=*) std= ;;
+    esac
+done
+exec "$real" $std "$@"

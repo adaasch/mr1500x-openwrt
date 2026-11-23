@@ -1,0 +1,31 @@
+diff --git a/tools/cmake/patches/010-bootstrap-skip-ghs.patch b/tools/cmake/patches/010-bootstrap-skip-ghs.patch
+new file mode 100644
+index 0000000000..683fcb137a
+--- /dev/null
++++ b/tools/cmake/patches/010-bootstrap-skip-ghs.patch
+@@ -0,0 +1,11 @@
++--- a/Source/cmake.cxx
+++++ b/Source/cmake.cxx
++@@ -112,7 +112,7 @@
++ #  include "cmExtraSublimeTextGenerator.h"
++ #endif
++ 
++-#if defined(__linux__) || defined(_WIN32)
+++#if !defined(CMAKE_BOOTSTRAP) && (defined(__linux__) || defined(_WIN32))
++ #  include "cmGlobalGhsMultiGenerator.h"
++ #endif
++ 
+diff --git a/tools/mtools/Makefile b/tools/mtools/Makefile
+index 5e3c950ba3..cd13954612 100644
+--- a/tools/mtools/Makefile
++++ b/tools/mtools/Makefile
+@@ -20,7 +20,8 @@ include $(INCLUDE_DIR)/host-build.mk
+ HOST_CONFIGURE_ARGS += --without-x
+ 
+ HOST_CONFIGURE_VARS += \
+-	ac_cv_header_iconv_h=no
++	ac_cv_header_iconv_h=no \
++	ac_cv_func_strtoi=no
+ 
+ define Host/Compile
+ 	$(MAKE) -C $(HOST_BUILD_DIR) mcopy mmd

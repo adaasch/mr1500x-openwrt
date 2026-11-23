@@ -1,0 +1,20 @@
+#!/bin/sh
+# Host C compiler shim for building OpenWrt 21.02 host tools with GCC >= 14.
+# build_image.sh links $OW/staging_dir/host/bin/{gcc,cc} here when needed.
+# Pins C17 unless the caller picked a standard, and downgrades the old-C
+# diagnostics GCC 14 promoted to errors (21.02-era tools trip them).
+real=${MR1500X_HOST_GCC:-/usr/bin/gcc}
+std=-std=gnu17
+for a in "$@"; do
+    case "$a" in
+        -std=*|--std=*) std= ;;
+    esac
+done
+exec "$real" $std \
+    -Wno-error=incompatible-pointer-types \
+    -Wno-error=implicit-function-declaration \
+    -Wno-error=int-conversion \
+    -Wno-error=implicit-int \
+    -Wno-error=return-mismatch \
+    -Wno-error=declaration-missing-parameter-type \
+    "$@"

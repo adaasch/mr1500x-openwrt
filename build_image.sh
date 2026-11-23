@@ -488,6 +488,32 @@ cp "$SELF/patches/900-rtl8192cd-sta-assoc-reply.patch" \
    "$OW/package/network/services/hostapd/patches/"
 step "patch staged"
 
+say "4b. host-tool fixes for newer host compilers"
+# OpenWrt 21.02's host tools predate GCC 14 (old-C diagnostics became errors)
+# and GCC 15 (default -std=gnu23). Patches in patches/openwrt/ fix what a
+# compiler flag cannot; each is applied once, and a re-run detects it is in.
+for p in "$SELF"/patches/openwrt/*.patch; do
+    [ -e "$p" ] || continue
+    if git -C "$OW" apply --check --reverse "$p" 2>/dev/null; then
+        continue
+    fi
+    git -C "$OW" apply "$p" || die "could not apply $(basename "$p") to $OW"
+done
+# The shims in tools/host-cc pin C17/C++17 and downgrade GCC 14's new errors.
+# OpenWrt's prereq check symlinks staging_dir/host/bin/{gcc,g++} to whatever
+# it found first and keeps an existing link, so pointing them at the shims
+# here is enough. `cc` is linked too: some tools (squashfskit4) call it.
+gcc_major=$(gcc -dumpversion 2>/dev/null | cut -d. -f1)
+if [ "${gcc_major:-0}" -ge 14 ]; then
+    mkdir -p "$OW/staging_dir/host/bin"
+    ln -sfn "$SELF/tools/host-cc/gcc" "$OW/staging_dir/host/bin/gcc"
+    ln -sfn "$SELF/tools/host-cc/gcc" "$OW/staging_dir/host/bin/cc"
+    ln -sfn "$SELF/tools/host-cc/g++" "$OW/staging_dir/host/bin/g++"
+    step "host GCC $gcc_major: patches applied, compiler shims linked"
+else
+    step "host GCC ${gcc_major:-?}: patches applied, no shims needed"
+fi
+
 say "5. build the userspace (this is the long one)"
 make -C "$OW" -j"$JOBS" tools/compile toolchain/compile > "$WORK/toolchain.log" 2>&1 \
     || { tail -30 "$WORK/toolchain.log"; die "toolchain build failed (log: $WORK/toolchain.log)"; }
