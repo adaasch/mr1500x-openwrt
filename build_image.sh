@@ -497,7 +497,7 @@ for p in "$SELF"/patches/openwrt/*.patch; do
     if git -C "$OW" apply --check --reverse "$p" 2>/dev/null; then
         continue
     fi
-    git -C "$OW" apply "$p" || die "could not apply $(basename "$p") to $OW"
+    git -C "$OW" apply --whitespace=nowarn "$p" || die "could not apply $(basename "$p") to $OW"
 done
 # The shims in tools/host-cc pin C17/C++17 and downgrade GCC 14's new errors.
 # OpenWrt's prereq check symlinks staging_dir/host/bin/{gcc,g++} to whatever
